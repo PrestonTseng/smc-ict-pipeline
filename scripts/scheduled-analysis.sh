@@ -33,6 +33,14 @@ for ((attempt = 1; attempt <= max_attempts; attempt++)); do
   sleep "$retry_delay"
 done
 
+case "$status" in
+  NO_SETUP|BLOCKED|TRADE|ORDER_PENDING|ARMED|SKIPPED_ALREADY_ANALYZED) ;;
+  *)
+    printf 'invalid analysis status: %s\n' "$status" >&2
+    exit 1
+    ;;
+esac
+
 if ! casebook="$(uv run smc-ict casebook --runs-root var/runs --output "$evidence_dir/casebook.json" --milestone-target 20 2>&1)"; then
   printf '%s\n' "$casebook" >&2
   exit 1

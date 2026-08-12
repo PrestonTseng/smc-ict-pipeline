@@ -69,6 +69,14 @@ def test_scheduled_analysis_reports_persistent_lock_collision(tmp_path: Path):
     assert "remained locked" in result.stderr
 
 
+def test_scheduled_analysis_rejects_failed_or_unknown_success_receipt(tmp_path: Path):
+    for index, receipt in enumerate(('{"status":"FAILED","error":"boom"}', '{"status":"UNKNOWN"}')):
+        result, counter = _run_analysis_script(tmp_path / f"bad-analysis-status-{index}", [receipt])
+        assert result.returncode != 0
+        assert "invalid analysis status" in result.stderr
+        assert counter.read_text() == "1"
+
+
 def test_scheduled_ingest_retries_lock_collision(tmp_path: Path):
     bin_dir, counter = _fake_uv(
         tmp_path,

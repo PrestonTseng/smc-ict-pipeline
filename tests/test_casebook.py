@@ -95,6 +95,17 @@ def _rewrite_manifest_file_hash(run: Path, name: str):
     manifest_path.write_bytes(_json_bytes(manifest))
 
 
+def _set_indicator_timestamp(run: Path, gate: str, timestamp: int):
+    decision_path = run / "decision.json"
+    decision = json.loads(decision_path.read_text())
+    for body in decision["symbols"].values():
+        indicator = body["indicators"][gate]
+        indicator["event_time"] = timestamp
+        indicator["known_at"] = timestamp
+    decision_path.write_bytes(_json_bytes(decision))
+    _rewrite_manifest_file_hash(run, "decision.json")
+
+
 def test_valid_runs_produce_deterministic_cases_and_summary(tmp_path: Path):
     runs = tmp_path / "runs"
     _write_run(runs, "run-b", 1_786_517_339_999, symbol_order=("ETHUSDT", "BTCUSDT"))
@@ -112,9 +123,23 @@ def test_valid_runs_produce_deterministic_cases_and_summary(tmp_path: Path):
         "discovered_runs": 2,
         "eligible_runs": 2,
         "ineligible_runs": 0,
+        "total_eligible_cases": 4,
+        "active_strategy_version": "v1-4h-1h-5m",
         "eligible_cases": 4,
         "unique_dataset_cutoffs": 1,
-        "strategy_versions": {"v1-4h-1h-5m": {"eligible_cases": 4, "unique_dataset_cutoffs": 1}},
+        "unique_analysis_boundaries": 0,
+        "strategy_versions": {
+            "v1-4h-1h-5m": {
+                "eligible_cases": 4,
+                "unique_dataset_cutoffs": 1,
+                "unique_analysis_boundaries": 0,
+                "status_counts": {"NO_SETUP": 4},
+                "failed_gate_counts": {"smc_4h_structure": 4},
+                "reason_counts": {"no_confirmed_bos": 4},
+                "milestone_remaining": 16,
+                "milestone_reached": False,
+            }
+        },
         "status_counts": {"NO_SETUP": 4},
         "failed_gate_counts": {"smc_4h_structure": 4},
         "reason_counts": {"no_confirmed_bos": 4},
@@ -152,9 +177,32 @@ def test_casebook_keeps_v1_and_v2_denominators_separate(tmp_path: Path):
     v2_cases = [row for row in result["cases"] if row["strategy_version"] == "v2-1d-4h-1h"]
     assert {row["analysis_boundary"] for row in v2_cases} == {1_786_517_999_999}
     assert result["summary"]["strategy_versions"] == {
-        "v1-4h-1h-5m": {"eligible_cases": 2, "unique_dataset_cutoffs": 1},
-        "v2-1d-4h-1h": {"eligible_cases": 2, "unique_dataset_cutoffs": 1},
+        "v1-4h-1h-5m": {
+            "eligible_cases": 2,
+            "unique_dataset_cutoffs": 1,
+            "unique_analysis_boundaries": 0,
+            "status_counts": {"NO_SETUP": 2},
+            "failed_gate_counts": {"smc_4h_structure": 2},
+            "reason_counts": {"no_confirmed_bos": 2},
+            "milestone_remaining": 18,
+            "milestone_reached": False,
+        },
+        "v2-1d-4h-1h": {
+            "eligible_cases": 2,
+            "unique_dataset_cutoffs": 1,
+            "unique_analysis_boundaries": 1,
+            "status_counts": {"NO_SETUP": 2},
+            "failed_gate_counts": {"smc_1d_regime": 2},
+            "reason_counts": {"no_confirmed_bos": 2},
+            "milestone_remaining": 18,
+            "milestone_reached": False,
+        },
     }
+    assert result["summary"]["total_eligible_cases"] == 4
+    assert result["summary"]["active_strategy_version"] == "v2-1d-4h-1h"
+    assert result["summary"]["eligible_cases"] == 2
+    assert result["summary"]["unique_analysis_boundaries"] == 1
+    assert result["summary"]["milestone_reached"] is False
 
 
 def test_schema_v2_rejects_unknown_strategy_version(tmp_path: Path):
@@ -167,6 +215,45 @@ def test_schema_v2_rejects_unknown_strategy_version(tmp_path: Path):
         strategy_version="unknown",
     )
     with pytest.raises(EvidenceError, match="strategy_version"):
+        build_casebook(runs)
+
+
+def test_casebook_rejects_future_or_misaligned_indicator_timestamps(tmp_path: Path):
+    runs = tmp_path / "runs"
+    future = _write_run(
+        runs,
+        "run-future",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    _set_indicator_timestamp(future, "smc_1d_regime", 1_786_521_599_999)
+    with pytest.raises(EvidenceError, match="exceeds analysis boundary"):
+        build_casebook(runs)
+
+    for path in future.iterdir():
+        if path.is_file():
+            path.unlink()
+        else:
+            path.rmdir()
+    future.rmdir()
+    misaligned = _write_run(
+        runs,
+        "run-misaligned",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    _set_indicator_timestamp(misaligned, "smc_1d_regime", 1_786_517_999_999)
+    with pytest.raises(EvidenceError, match="timeframe-close aligned"):
+        build_casebook(runs)
+
+
+def test_casebook_rejects_future_v1_indicator_timestamp(tmp_path: Path):
+    runs = tmp_path / "runs"
+    run = _write_run(runs, "run-v1-future", 1_786_517_339_999)
+    _set_indicator_timestamp(run, "smc_4h_structure", 1_786_521_599_999)
+    with pytest.raises(EvidenceError, match="exceeds analysis boundary"):
         build_casebook(runs)
 
 
@@ -189,6 +276,14 @@ def test_declared_artifact_tampering_fails_closed(tmp_path: Path):
     (run / "decision.json").write_bytes(b"{}\n")
 
     with pytest.raises(EvidenceError, match="decision.json hash mismatch"):
+        build_casebook(runs)
+
+
+def test_nonempty_indicators_directory_fails_closed(tmp_path: Path):
+    runs = tmp_path / "runs"
+    run = _write_run(runs, "run-extra-indicator", 1_786_517_339_999)
+    (run / "indicators" / "undeclared.json").write_text("{}\n")
+    with pytest.raises(EvidenceError, match="indicators directory must be empty"):
         build_casebook(runs)
 
 
@@ -600,7 +695,7 @@ def test_lock_symlink_failure_does_not_leak_parent_fd(tmp_path: Path):
         with pytest.raises(OSError):
             publish_casebook(runs, output)
 
-    assert len(os.listdir("/proc/self/fd")) == before
+    assert len(os.listdir("/proc/self/fd")) <= before
 
 
 def test_lock_open_failure_does_not_leak_parent_fd(tmp_path: Path, monkeypatch):
@@ -618,7 +713,7 @@ def test_lock_open_failure_does_not_leak_parent_fd(tmp_path: Path, monkeypatch):
     before = len(os.listdir("/proc/self/fd"))
     with pytest.raises(OSError, match="injected lock"):
         publish_casebook(runs, output)
-    assert len(os.listdir("/proc/self/fd")) == before
+    assert len(os.listdir("/proc/self/fd")) <= before
 
 
 def test_unlock_failure_preserves_primary_exception_and_closes_fds(tmp_path: Path, monkeypatch):
@@ -643,7 +738,7 @@ def test_unlock_failure_preserves_primary_exception_and_closes_fds(tmp_path: Pat
         publish_casebook(runs, output)
     assert captured.value is primary
     assert any("cleanup failed" in note for note in primary.__notes__)
-    assert len(os.listdir("/proc/self/fd")) == before
+    assert len(os.listdir("/proc/self/fd")) <= before
 
 
 def test_unlock_failure_after_success_closes_fds_then_raises(tmp_path: Path, monkeypatch):
@@ -661,4 +756,4 @@ def test_unlock_failure_after_success_closes_fds_then_raises(tmp_path: Path, mon
     before = len(os.listdir("/proc/self/fd"))
     with pytest.raises(RuntimeError, match="injected unlock"):
         publish_casebook(runs, output)
-    assert len(os.listdir("/proc/self/fd")) == before
+    assert len(os.listdir("/proc/self/fd")) <= before

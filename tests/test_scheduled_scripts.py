@@ -54,7 +54,7 @@ def test_scheduled_analysis_retries_lock_collision_then_builds_casebook(tmp_path
         [
             '{"status":"SKIPPED_LOCKED"}',
             '{"status":"SKIPPED_LOCKED"}',
-            '{"status":"NO_SETUP","dataset_version":"ds-x"}',
+            '{"status":"NO_SETUP","dataset_version":"ds-x","strategy_version":"v2-1d-4h-1h","analysis_boundary":7199999}',
             '{"eligible_cases":20,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}',
         ],
     )
@@ -74,6 +74,21 @@ def test_scheduled_analysis_rejects_failed_or_unknown_success_receipt(tmp_path: 
         result, counter = _run_analysis_script(tmp_path / f"bad-analysis-status-{index}", [receipt])
         assert result.returncode != 0
         assert "invalid analysis status" in result.stderr
+        assert counter.read_text() == "1"
+
+
+def test_scheduled_analysis_rejects_missing_or_wrong_v2_identity(tmp_path: Path):
+    invalid = (
+        '{"status":"NO_SETUP","dataset_version":"ds-x","analysis_boundary":7199999}',
+        '{"status":"NO_SETUP","dataset_version":"ds-x","strategy_version":"v1-4h-1h-5m","analysis_boundary":7199999}',
+        '{"status":"NO_SETUP","dataset_version":"ds-x","strategy_version":"v2-1d-4h-1h","analysis_boundary":7200000}',
+    )
+    for index, receipt in enumerate(invalid):
+        result, counter = _run_analysis_script(
+            tmp_path / f"bad-analysis-identity-{index}", [receipt]
+        )
+        assert result.returncode != 0
+        assert "invalid v2 identity" in result.stderr
         assert counter.read_text() == "1"
 
 
@@ -151,6 +166,7 @@ def test_scheduled_ingest_rejects_failed_or_unknown_success_receipt(tmp_path: Pa
         assert result.returncode != 0
         assert "invalid ingestion status" in result.stderr
         assert counter.read_text() == "1"
+        assert not (case / "logs" / "ingestion.jsonl").exists()
 
 
 def test_scheduled_wrappers_reject_invalid_retry_configuration(tmp_path: Path):
@@ -212,7 +228,7 @@ def test_scheduled_wrappers_reject_mixed_or_invalid_receipts(tmp_path: Path):
 
 
 def test_scheduled_analysis_rejects_invalid_casebook_receipt(tmp_path: Path):
-    valid_analysis = '{"status":"NO_SETUP","dataset_version":"ds-x"}'
+    valid_analysis = '{"status":"NO_SETUP","dataset_version":"ds-x","strategy_version":"v2-1d-4h-1h","analysis_boundary":7199999}'
     invalid_receipts = (
         'warning-before-{"eligible_cases":20,"sha256":"' + "a" * 64 + '"}',
         '{"eligible_cases":20,"sha256":"' + "a" * 64 + '"}\\n{}',

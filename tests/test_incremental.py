@@ -40,9 +40,10 @@ def test_new_dataset_inherits_prior_snapshot_and_replaces_overlap(tmp_path: Path
 class RecordingClient:
     def __init__(self):
         self.calls = []
+        self.cutoff = 4_019_999
 
     def latest_closed_cutoff(self):
-        return 419_999
+        return self.cutoff
 
     def fetch_1m(self, symbol, start, end):
         self.calls.append((symbol, start, end))
@@ -55,9 +56,9 @@ def test_orchestrator_uses_overlap_after_bootstrap(tmp_path: Path):
     orchestrator = Orchestrator(cfg, client)
     assert orchestrator.run_once().status != "FAILED"
     client.calls.clear()
-    client.latest_closed_cutoff = lambda: 539_999
+    client.cutoff = 4_139_999
     assert orchestrator.run_once().status != "FAILED"
-    assert {start for _, start, _ in client.calls} == {300_000}
+    assert {start for _, start, _ in client.calls} == {3_900_000}
 
 
 def test_same_cutoff_reuses_dataset_and_closed_hour_analysis(tmp_path: Path):
@@ -80,7 +81,7 @@ def test_older_cutoff_fails_without_new_artifact(tmp_path: Path):
     orchestrator = Orchestrator(cfg, client)
     assert orchestrator.run_once().status != "FAILED"
     before = set((tmp_path / "runs" / "1970-01-01").iterdir())
-    client.latest_closed_cutoff = lambda: 359_999
+    client.cutoff = 3_959_999
     result = orchestrator.run_once()
     assert result.status == "FAILED" and "regressed" in result.error
     assert set((tmp_path / "runs" / "1970-01-01").iterdir()) == before

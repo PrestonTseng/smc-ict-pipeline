@@ -45,6 +45,17 @@ CREATE TABLE IF NOT EXISTS dataset_bars(
     open_time INTEGER, row_hash TEXT,
     PRIMARY KEY(version, symbol, open_time)
 );
+CREATE TABLE IF NOT EXISTS analysis_claims(
+    strategy_version TEXT NOT NULL,
+    analysis_boundary INTEGER NOT NULL,
+    dataset_version TEXT NOT NULL REFERENCES datasets(version),
+    ingestion_run_id TEXT NOT NULL REFERENCES ingestion_runs(ingestion_run_id),
+    analysis_run_id TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK(status IN ('CLAIMED','PUBLISHED')),
+    claimed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    published_at TEXT,
+    PRIMARY KEY(strategy_version, analysis_boundary)
+);
 """
 
 
@@ -153,6 +164,55 @@ class MarketRepository:
                 (dataset_version,),
             ).fetchall()
         return str(rows[0][0]) if len(rows) == 1 else None
+
+    def claim_analysis_boundary(
+        self,
+        strategy_version: str,
+        analysis_boundary: int,
+        dataset_version: str,
+        ingestion_run_id: str,
+        analysis_run_id: str,
+    ) -> tuple[bool, tuple[str, str, str, str] | None]:
+        with self._c() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    """INSERT INTO analysis_claims(
+                    strategy_version,analysis_boundary,dataset_version,
+                    ingestion_run_id,analysis_run_id,status
+                    ) VALUES (?,?,?,?,?,'CLAIMED')""",
+                    (
+                        strategy_version,
+                        analysis_boundary,
+                        dataset_version,
+                        ingestion_run_id,
+                        analysis_run_id,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                row = connection.execute(
+                    """SELECT dataset_version,ingestion_run_id,analysis_run_id,status
+                    FROM analysis_claims
+                    WHERE strategy_version=? AND analysis_boundary=?""",
+                    (strategy_version, analysis_boundary),
+                ).fetchone()
+                if row is None:
+                    return False, None
+                return False, (str(row[0]), str(row[1]), str(row[2]), str(row[3]))
+        return True, None
+
+    def publish_analysis_claim(
+        self, strategy_version: str, analysis_boundary: int, analysis_run_id: str
+    ) -> None:
+        with self._c() as connection:
+            cursor = connection.execute(
+                """UPDATE analysis_claims SET status='PUBLISHED',published_at=CURRENT_TIMESTAMP
+                WHERE strategy_version=? AND analysis_boundary=?
+                AND analysis_run_id=? AND status='CLAIMED'""",
+                (strategy_version, analysis_boundary, analysis_run_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValidationError("analysis claim publish mismatch")
 
     def start_ingestion(self, ingestion_run_id: str, cutoff: int | None = None) -> None:
         with self._c() as connection:

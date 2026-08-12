@@ -1,5 +1,6 @@
 import json
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from smc_ict.config import AppConfig
@@ -89,6 +90,28 @@ def test_v2_analysis_is_idempotent_per_closed_one_hour_boundary(tmp_path: Path):
     assert second.status == "SKIPPED_ALREADY_ANALYZED"
     assert second.analysis_run_id == first.analysis_run_id
     assert second.run_dir == first.run_dir
+
+
+def test_v2_analysis_boundary_claim_is_atomic_across_concurrent_callers(tmp_path: Path):
+    cfg = AppConfig(data_root=tmp_path, bootstrap_bars=300)
+    orchestrator = Orchestrator(cfg, FixtureBinanceClient())
+    orchestrator.ingest_once()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: orchestrator.analyze_latest(), range(2)))
+
+    assert len(list((tmp_path / "runs").glob("*/run-*"))) == 1
+    assert (
+        sum(result.status not in {"FAILED", "SKIPPED_ALREADY_ANALYZED"} for result in results) == 1
+    )
+    assert all(
+        result.status != "FAILED" or "already claimed" in (result.error or "") for result in results
+    )
+    with __import__("sqlite3").connect(tmp_path / "data" / "market.sqlite3") as connection:
+        claims = connection.execute(
+            "SELECT strategy_version,analysis_boundary,status FROM analysis_claims"
+        ).fetchall()
+    assert claims == [("v2-1d-4h-1h", 17_999_999, "PUBLISHED")]
 
 
 def test_v2_dedup_rejects_tampered_existing_artifact(tmp_path: Path):

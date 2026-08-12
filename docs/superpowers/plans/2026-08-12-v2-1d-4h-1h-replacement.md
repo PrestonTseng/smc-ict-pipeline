@@ -13,7 +13,7 @@
 - Binance USDⓈ-M closed 1m remains the only canonical market-data grain.
 - Ingestion remains every minute with overlap, pagination, continuity validation, and BTC/ETH atomic publication.
 - Only complete UTC-aligned 1D/4H/1H bars may be used.
-- v1 immutable artifacts remain byte-unchanged and retain their denominator.
+- v1 immutable artifacts remain byte-unchanged through controlled v2 verification. After that gate, delete only v1 strategy-specific artifacts under Preston's explicit approval; retain canonical closed-1m data and ingestion lineage.
 - v2 is long-only, research-only, deterministic, fail-closed, and creates no order or PnL.
 - No scheduler cutover before exact review, push, and CI success.
 
@@ -87,5 +87,5 @@
 - [ ] Exercise v2 against a copy of the live SQLite dataset; verify pinned lineage, no market fetch, immutable artifact, and no mutation of v1 evidence.
 - [ ] Stage exact files, compute digest, obtain adversarial review with empty security/logic arrays.
 - [ ] Commit, push, wait for CI success, and prove local/remote SHA equality.
-- [ ] Pause/remove only job `c5b5c84e6e18`, update SHA-pinned wrappers, create the hourly v2 job, controlled-run it, and verify no new v1 decision appears after cutover.
-- [ ] Rebuild daily casebook, verify versioned denominators, and update canonical plan/status.
+- [ ] Pause only job `c5b5c84e6e18`, update SHA-pinned wrappers, update that same job in place to hourly v2 cadence, controlled-run it, and verify no new v1 decision appears after cutover.
+- [ ] Verify the first production v2 artifact and v2-only casebook, then delete approved v1 strategy artifacts/logs while preserving the canonical SQLite/ingestion SSOT; rebuild the casebook and update canonical plan/status.

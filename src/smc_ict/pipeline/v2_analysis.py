@@ -103,7 +103,7 @@ def analyze_symbol_v2(snapshot, symbol: str, strategy) -> dict:
 
     swings60 = confirmed_swings(bars60, strategy.swing_length)
     frozen_lows = [
-        swing for swing in swings60 if swing.kind == "low" and swing.known_index <= poi_touch_1h
+        swing for swing in swings60 if swing.kind == "low" and swing.known_index < poi_touch_1h
     ]
     if not frozen_lows:
         results["ict_1h_liquidity"] = unavailable("no_frozen_sell_side_liquidity")
@@ -143,7 +143,7 @@ def analyze_symbol_v2(snapshot, symbol: str, strategy) -> dict:
         return _finish(results)
 
     frozen_highs = [
-        swing for swing in swings60 if swing.kind == "high" and swing.known_index <= sweep_index
+        swing for swing in swings60 if swing.kind == "high" and swing.known_index < sweep_index
     ]
     if not frozen_highs:
         results["ict_1h_mss"] = unavailable("no_frozen_opposing_swing")

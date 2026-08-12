@@ -30,6 +30,33 @@ def _finish(results: dict[str, IndicatorResult]) -> dict:
     }
 
 
+def _apply_context(results, bars1440, bars240, cutoff_index, strategy) -> bool:
+    cutoff = bars240[cutoff_index].close_time
+    causal_1d = tuple(bar for bar in bars1440 if bar.close_time <= cutoff)
+    causal_4h = bars240[: cutoff_index + 1]
+    if not causal_1d:
+        results["smc_1d_regime"] = unavailable("insufficient_1d_context")
+        return False
+    results["smc_1d_regime"] = structure(causal_1d, strategy)
+    if results["smc_1d_regime"].status != Status.PASS:
+        return False
+    if Bias(results["smc_1d_regime"].value["bias"]) != Bias.BULLISH:
+        results["smc_4h_structure"] = IndicatorResult(
+            Status.FAIL, {}, reason_codes=("v2_long_only",)
+        )
+        return False
+    results["smc_4h_structure"] = structure(causal_4h, strategy)
+    if results["smc_4h_structure"].status != Status.PASS:
+        return False
+    if Bias(results["smc_4h_structure"].value["bias"]) != Bias.BULLISH:
+        results["smc_4h_structure"] = IndicatorResult(
+            Status.FAIL, {}, reason_codes=("4h_not_aligned_bullish",)
+        )
+        return False
+    results["smc_4h_dealing_range"] = dealing(causal_4h, Bias.BULLISH)
+    return results["smc_4h_dealing_range"].status == Status.PASS
+
+
 def analyze_symbol_v2(snapshot, symbol: str, strategy) -> dict:
     bars1 = snapshot.bars(symbol)
     bars1440 = resample_bars(bars1, 1440)
@@ -49,7 +76,7 @@ def analyze_symbol_v2(snapshot, symbol: str, strategy) -> dict:
         and any(bar.close > swing.price for bar in bars240[swing.known_index + 1 :])
     ]
     if not broken_highs:
-        results["smc_4h_order_block"] = unavailable("no_confirmed_4h_bos")
+        _apply_context(results, bars1440, bars240, len(bars240) - 1, strategy)
         return _finish(results)
     broken = broken_highs[-1]
     break_index = next(
@@ -61,7 +88,8 @@ def analyze_symbol_v2(snapshot, symbol: str, strategy) -> dict:
         bars240, Bias.BULLISH, impulse_start=impulse_start, break_index=break_index
     )
     if candidate_order_block.status != Status.PASS:
-        results["smc_4h_order_block"] = candidate_order_block
+        if _apply_context(results, bars1440, bars240, break_index, strategy):
+            results["smc_4h_order_block"] = candidate_order_block
         return _finish(results)
 
     poi_touch_4h = int(candidate_order_block.value["first_touch_index"])
@@ -71,29 +99,7 @@ def analyze_symbol_v2(snapshot, symbol: str, strategy) -> dict:
     if poi_known_at is None:
         results["ict_1h_liquidity"] = unavailable("4h_poi_known_at_missing")
         return _finish(results)
-    causal_1d = tuple(bar for bar in bars1440 if bar.close_time <= poi_known_at)
-    causal_4h = bars240[: poi_touch_4h + 1]
-    if not causal_1d:
-        results["smc_1d_regime"] = unavailable("insufficient_1d_context_at_poi")
-        return _finish(results)
-    results["smc_1d_regime"] = structure(causal_1d, strategy)
-    if results["smc_1d_regime"].status != Status.PASS:
-        return _finish(results)
-    if Bias(results["smc_1d_regime"].value["bias"]) != Bias.BULLISH:
-        results["smc_4h_structure"] = IndicatorResult(
-            Status.FAIL, {}, reason_codes=("v2_long_only",)
-        )
-        return _finish(results)
-    results["smc_4h_structure"] = structure(causal_4h, strategy)
-    if results["smc_4h_structure"].status != Status.PASS:
-        return _finish(results)
-    if Bias(results["smc_4h_structure"].value["bias"]) != Bias.BULLISH:
-        results["smc_4h_structure"] = IndicatorResult(
-            Status.FAIL, {}, reason_codes=("4h_not_aligned_bullish",)
-        )
-        return _finish(results)
-    results["smc_4h_dealing_range"] = dealing(causal_4h, Bias.BULLISH)
-    if results["smc_4h_dealing_range"].status != Status.PASS:
+    if not _apply_context(results, bars1440, bars240, poi_touch_4h, strategy):
         return _finish(results)
     results["smc_4h_order_block"] = candidate_order_block
     poi_touch_1h = first_zone_touch(bars60, ob_low, ob_high, after=poi_known_at)

@@ -115,6 +115,27 @@ def test_v2_stops_at_unconfirmed_daily_regime(monkeypatch):
     ]
 
 
+def test_v2_reports_context_gate_when_no_4h_bos_exists(monkeypatch):
+    import smc_ict.pipeline.v2_analysis as module
+
+    aggregates = {1440: bars(1440), 240: bars(240), 60: bars(60)}
+    monkeypatch.setattr(module, "resample_bars", lambda source, minutes: aggregates[minutes])
+    monkeypatch.setattr(module, "confirmed_swings", lambda *_: ())
+    structures = iter(
+        [
+            result(Status.PASS, Bias.BULLISH, ("bullish_bos",)),
+            result(Status.FAIL, Bias.NEUTRAL, ("no_confirmed_bos",)),
+        ]
+    )
+    monkeypatch.setattr(module, "structure", lambda *_: next(structures))
+
+    analyzed = module.analyze_symbol_v2(Snapshot(), "BTCUSDT", StrategyConfig())
+
+    assert analyzed["decision"]["status"] == "NO_SETUP"
+    assert analyzed["decision"]["failed_gate"] == "smc_4h_structure"
+    assert analyzed["decision"]["reason_codes"] == ["no_confirmed_bos"]
+
+
 def test_v2_long_only_stops_after_bearish_daily_bos(monkeypatch):
     import smc_ict.pipeline.v2_analysis as module
 

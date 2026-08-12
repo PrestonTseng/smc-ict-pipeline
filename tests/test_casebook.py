@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 
 from smc_ict.casebook import EvidenceError, build_casebook, publish_casebook, render_casebook
 from smc_ict.cli import main
+from smc_ict.config import config_hash as compute_config_hash
 from smc_ict.pipeline.state_machine import GATES
 from smc_ict.pipeline.v2_state_machine import V2_GATES
 
@@ -30,8 +32,9 @@ def _write_run(
     run = root / day / run_id
     run.mkdir(parents=True)
     (run / "indicators").mkdir()
-    config_hash = "a" * 64
-    config = {"_config_hash": config_hash, "symbols": list(symbol_order)}
+    config: dict = {"symbols": list(symbol_order)}
+    config_hash = compute_config_hash(config) if schema_version == "2" else "a" * 64
+    config["_config_hash"] = config_hash
     gates = V2_GATES if strategy_version == "v2-1d-4h-1h" else GATES
     first_gate = gates[0]
     decision = {
@@ -85,7 +88,34 @@ def _write_run(
         manifest["strategy_version"] = strategy_version
         manifest["analysis_boundary"] = ((cutoff + 1) // 3_600_000) * 3_600_000 - 1
     (run / "manifest.json").write_bytes(_json_bytes(manifest))
+    if schema_version == "2":
+        _sync_claim(run)
     return run
+
+
+def _sync_claim(run: Path):
+    manifest_path = run / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    database = run.parents[2] / "data" / "market.sqlite3"
+    database.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS analysis_claims(
+            strategy_version TEXT, analysis_boundary INTEGER, analysis_run_id TEXT,
+            status TEXT, artifact_day TEXT, manifest_sha256 TEXT,
+            PRIMARY KEY(strategy_version,analysis_boundary))"""
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO analysis_claims VALUES (?,?,?,?,?,?)",
+            (
+                manifest["strategy_version"],
+                manifest["analysis_boundary"],
+                manifest["analysis_run_id"],
+                "PUBLISHED",
+                run.parent.name,
+                hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            ),
+        )
 
 
 def _rewrite_manifest_file_hash(run: Path, name: str):
@@ -93,6 +123,8 @@ def _rewrite_manifest_file_hash(run: Path, name: str):
     manifest = json.loads(manifest_path.read_text())
     manifest["files"][name] = hashlib.sha256((run / name).read_bytes()).hexdigest()
     manifest_path.write_bytes(_json_bytes(manifest))
+    if manifest.get("schema_version") == "2":
+        _sync_claim(run)
 
 
 def _set_indicator_timestamp(run: Path, gate: str, timestamp: int):
@@ -124,9 +156,9 @@ def test_valid_runs_produce_deterministic_cases_and_summary(tmp_path: Path):
         "eligible_runs": 2,
         "ineligible_runs": 0,
         "total_eligible_cases": 4,
-        "active_strategy_version": "v1-4h-1h-5m",
-        "eligible_cases": 4,
-        "unique_dataset_cutoffs": 1,
+        "active_strategy_version": "v2-1d-4h-1h",
+        "eligible_cases": 0,
+        "unique_dataset_cutoffs": 0,
         "unique_analysis_boundaries": 0,
         "strategy_versions": {
             "v1-4h-1h-5m": {
@@ -140,11 +172,11 @@ def test_valid_runs_produce_deterministic_cases_and_summary(tmp_path: Path):
                 "milestone_reached": False,
             }
         },
-        "status_counts": {"NO_SETUP": 4},
-        "failed_gate_counts": {"smc_4h_structure": 4},
-        "reason_counts": {"no_confirmed_bos": 4},
+        "status_counts": {},
+        "failed_gate_counts": {},
+        "reason_counts": {},
         "milestone_target": 20,
-        "milestone_remaining": 16,
+        "milestone_remaining": 20,
         "milestone_reached": False,
     }
     first = result["cases"][0]
@@ -203,6 +235,47 @@ def test_casebook_keeps_v1_and_v2_denominators_separate(tmp_path: Path):
     assert result["summary"]["eligible_cases"] == 2
     assert result["summary"]["unique_analysis_boundaries"] == 1
     assert result["summary"]["milestone_reached"] is False
+
+
+def test_v2_casebook_requires_published_claim_and_exact_manifest_commitment(tmp_path: Path):
+    runs = tmp_path / "runs"
+    run = _write_run(
+        runs,
+        "run-claim",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    database = tmp_path / "data" / "market.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE analysis_claims SET status='CLAIMED'")
+    with pytest.raises(EvidenceError, match="published claim mismatch"):
+        build_casebook(runs)
+
+    _sync_claim(run)
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE analysis_claims SET manifest_sha256=?", ("0" * 64,))
+    with pytest.raises(EvidenceError, match="published claim mismatch"):
+        build_casebook(runs)
+
+
+def test_v2_casebook_recomputes_governed_config_hash(tmp_path: Path):
+    runs = tmp_path / "runs"
+    run = _write_run(
+        runs,
+        "run-config-tamper",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    config_path = run / "config-snapshot.json"
+    config = json.loads(config_path.read_text())
+    config["bootstrap_bars"] = 999999
+    config_path.write_bytes(_json_bytes(config))
+    _rewrite_manifest_file_hash(run, "config-snapshot.json")
+
+    with pytest.raises(EvidenceError, match="config snapshot content hash mismatch"):
+        build_casebook(runs)
 
 
 def test_schema_v2_rejects_unknown_strategy_version(tmp_path: Path):
@@ -327,9 +400,9 @@ def test_publication_is_atomic_deterministic_and_read_only(tmp_path: Path):
         == {
             "output": str(output),
             "sha256": hashlib.sha256(first_bytes).hexdigest(),
-            "eligible_cases": 2,
+            "eligible_cases": 0,
             "milestone_target": 30,
-            "milestone_remaining": 28,
+            "milestone_remaining": 30,
             "milestone_reached": False,
         }
     )
@@ -363,7 +436,7 @@ def test_casebook_cli_publishes_machine_result(tmp_path: Path, capsys):
     )
     result = json.loads(capsys.readouterr().out)
     assert result["output"] == str(output)
-    assert result["eligible_cases"] == 2
+    assert result["eligible_cases"] == 0
     assert result["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
 
 
@@ -590,7 +663,7 @@ def test_indicators_directory_is_optional(tmp_path: Path):
     run = _write_run(runs, "run-no-indicator-dir", 1_786_517_339_999)
     (run / "indicators").rmdir()
 
-    assert build_casebook(runs)["summary"]["eligible_cases"] == 2
+    assert build_casebook(runs)["summary"]["eligible_cases"] == 0
 
 
 @pytest.mark.parametrize(

@@ -25,6 +25,8 @@ Strict long-only fail-fast order:
 8. `ict_1h_fvg`: first bullish FVG retraces to its configured 50% entry within the wait window.
 9. `risk`: stop beyond the 1H sweep extreme plus ATR buffer; target the frozen opposing 4H swing high; require fee/slippage-adjusted net R ≥ 2.
 
+The 4H POI touch close is the common causal cutoff for all higher-timeframe gates: 1D regime, 4H structure, and 4H dealing range are recomputed using only bars complete at or before that cutoff. Later 1D/4H information may not qualify an earlier POI. Every frozen 4H target swing must be known strictly before the POI touch.
+
 The existing configuration bar counts become v2 execution-bar counts and are frozen in every run. They are not silently optimized from evidence.
 
 ## Version and evidence boundary
@@ -34,6 +36,7 @@ The existing configuration bar counts become v2 execution-bar counts and are fro
 - Casebook rows carry strategy version and summaries expose per-version denominators.
 - Historical bytes are never rewritten. Before approved v1 deletion, v1 and v2 rows remain separate and are never pooled for strategy conclusions.
 - Active summaries, milestone gates, status/reason counts, and unique closed-1H denominators are v2-only. Any total case count is inventory, not strategy evidence.
+- A schema-v2 run is eligible only when the canonical SQLite repository contains a matching `PUBLISHED` claim committed to the exact strategy, boundary, run ID, day, and manifest SHA-256. A crash-left public directory under a `CLAIMED` row is not evidence.
 - Every non-null indicator event/knowledge timestamp is at or before its manifest boundary and aligned to the corresponding UTC timeframe close.
 
 ## Scheduler cutover
@@ -47,4 +50,4 @@ The existing configuration bar counts become v2 execution-bar counts and are fro
 
 Research-only; no exchange credentials, orders, PnL fabrication, automatic tuning, historical backfill, or rule promotion.
 
-After the first controlled production v2 artifact and casebook are verified, deletion is limited to v1 run artifacts, v1 casebook output/rows, and v1 analysis logs/receipts. The canonical closed-1m SQLite database, committed datasets, ingestion lineage, ingestion logs, and backups remain intact because they are the shared v2 SSOT.
+After the first controlled production v2 artifact and casebook are verified, deletion is limited to v1/legacy runtime run artifacts, old casebook output/rows, and old analysis logs/receipts. No runtime archive is created: old implementation and schema history remain in Git. The canonical closed-1m SQLite database, committed datasets, ingestion lineage, ingestion logs, and backups remain intact because they are the shared v2 SSOT.

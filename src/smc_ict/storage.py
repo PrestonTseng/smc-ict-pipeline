@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+import stat
 import uuid
 from decimal import Decimal
 from pathlib import Path
@@ -54,6 +56,8 @@ CREATE TABLE IF NOT EXISTS analysis_claims(
     status TEXT NOT NULL CHECK(status IN ('CLAIMED','PUBLISHED')),
     claimed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     published_at TEXT,
+    artifact_day TEXT,
+    manifest_sha256 TEXT,
     PRIMARY KEY(strategy_version, analysis_boundary)
 );
 """
@@ -76,6 +80,10 @@ class MarketRepository:
                     "ALTER TABLE ingestion_runs ADD COLUMN dataset_version "
                     "TEXT REFERENCES datasets(version)"
                 )
+            claim_columns = {row[1] for row in c.execute("PRAGMA table_info(analysis_claims)")}
+            for name in ("artifact_day", "manifest_sha256"):
+                if name not in claim_columns:
+                    c.execute(f"ALTER TABLE analysis_claims ADD COLUMN {name} TEXT")
             schema_version = int(c.execute("PRAGMA user_version").fetchone()[0])
             if schema_version < 1:
                 c.execute(
@@ -202,14 +210,75 @@ class MarketRepository:
         return True, None
 
     def publish_analysis_claim(
-        self, strategy_version: str, analysis_boundary: int, analysis_run_id: str
+        self,
+        strategy_version: str,
+        analysis_boundary: int,
+        analysis_run_id: str,
+        run_dir: Path,
+        manifest_sha256: str,
     ) -> None:
+        run_fd = os.open(run_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            manifest_fd = os.open(
+                "manifest.json", os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=run_fd
+            )
+            try:
+                if not stat.S_ISREG(os.fstat(manifest_fd).st_mode):
+                    raise ValidationError("analysis artifact type mismatch")
+                chunks = []
+                while chunk := os.read(manifest_fd, 1 << 20):
+                    chunks.append(chunk)
+                manifest_bytes = b"".join(chunks)
+            finally:
+                os.close(manifest_fd)
+            if hashlib.sha256(manifest_bytes).hexdigest() != manifest_sha256:
+                raise ValidationError("analysis manifest commitment mismatch")
+            manifest = json.loads(manifest_bytes)
+            if set(os.listdir(run_fd)) != {
+                "config-snapshot.json",
+                "decision.json",
+                "manifest.json",
+            } or set(manifest.get("files", {})) != {
+                "config-snapshot.json",
+                "decision.json",
+            }:
+                raise ValidationError("analysis artifact set mismatch")
+            for name, expected_hash in manifest["files"].items():
+                artifact_fd = os.open(
+                    name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=run_fd
+                )
+                try:
+                    if not stat.S_ISREG(os.fstat(artifact_fd).st_mode):
+                        raise ValidationError("analysis artifact type mismatch")
+                    digest = hashlib.sha256()
+                    while chunk := os.read(artifact_fd, 1 << 20):
+                        digest.update(chunk)
+                finally:
+                    os.close(artifact_fd)
+                if digest.hexdigest() != expected_hash:
+                    raise ValidationError("analysis artifact hash mismatch")
+        finally:
+            os.close(run_fd)
+
+        if (
+            manifest.get("analysis_run_id") != analysis_run_id
+            or manifest.get("strategy_version") != strategy_version
+            or manifest.get("analysis_boundary") != analysis_boundary
+        ):
+            raise ValidationError("analysis manifest identity mismatch")
         with self._c() as connection:
             cursor = connection.execute(
-                """UPDATE analysis_claims SET status='PUBLISHED',published_at=CURRENT_TIMESTAMP
+                """UPDATE analysis_claims SET status='PUBLISHED',published_at=CURRENT_TIMESTAMP,
+                artifact_day=?,manifest_sha256=?
                 WHERE strategy_version=? AND analysis_boundary=?
                 AND analysis_run_id=? AND status='CLAIMED'""",
-                (strategy_version, analysis_boundary, analysis_run_id),
+                (
+                    run_dir.parent.name,
+                    manifest_sha256,
+                    strategy_version,
+                    analysis_boundary,
+                    analysis_run_id,
+                ),
             )
             if cursor.rowcount != 1:
                 raise ValidationError("analysis claim publish mismatch")

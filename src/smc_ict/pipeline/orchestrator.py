@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
@@ -46,8 +47,10 @@ def _write_json_at(directory_fd: int, name: str, value: dict) -> bytes:
 
 
 def _read_at(directory_fd: int, name: str) -> bytes:
-    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory_fd)
     try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"published artifact is not a regular file: {name}")
         chunks = []
         while chunk := os.read(fd, 1 << 20):
             chunks.append(chunk)
@@ -86,6 +89,7 @@ class RunResult:
     error: str | None = None
     strategy_version: str | None = None
     analysis_boundary: int | None = None
+    manifest_sha256: str | None = None
 
 
 class Orchestrator:
@@ -193,7 +197,15 @@ class Orchestrator:
                 config_digest,
                 run_id,
             )
-            repo.publish_analysis_claim(V2_STRATEGY_VERSION, analysis_boundary, run_id)
+            if published.run_dir is None or published.manifest_sha256 is None:
+                raise ValueError("published artifact commitment missing")
+            repo.publish_analysis_claim(
+                V2_STRATEGY_VERSION,
+                analysis_boundary,
+                run_id,
+                published.run_dir,
+                published.manifest_sha256,
+            )
             return published
         except Exception as e:
             return RunResult(
@@ -269,6 +281,7 @@ class Orchestrator:
             "files": {},
         }
         data_root_fd = _open_directory(self.config.data_root)
+        manifest_payload = b""
         try:
             runs_fd = _mkdir_open("runs", dir_fd=data_root_fd)
             try:
@@ -288,29 +301,34 @@ class Orchestrator:
                             name: hashlib.sha256(payload).hexdigest()
                             for name, payload in payloads.items()
                         }
-                        _write_json_at(run_fd, "manifest.json", manifest)
+                        manifest_payload = _write_json_at(run_fd, "manifest.json", manifest)
+                        staged_identity = os.fstat(run_fd)
                         os.fsync(run_fd)
+                        os.rename(run_id, run_id, src_dir_fd=tmp_fd, dst_dir_fd=day_fd)
+                        os.fsync(tmp_fd)
+                        os.fsync(day_fd)
+                        public_fd = _open_directory(run_id, dir_fd=day_fd)
+                        try:
+                            public_identity = os.fstat(public_fd)
+                            if (public_identity.st_dev, public_identity.st_ino) != (
+                                staged_identity.st_dev,
+                                staged_identity.st_ino,
+                            ):
+                                raise ValueError("published run inode mismatch")
+                            if set(os.listdir(public_fd)) != {
+                                "config-snapshot.json",
+                                "decision.json",
+                                "manifest.json",
+                            }:
+                                raise ValueError("published run artifact set mismatch")
+                            expected_payloads = payloads | {"manifest.json": manifest_payload}
+                            for name, expected_payload in expected_payloads.items():
+                                if _read_at(public_fd, name) != expected_payload:
+                                    raise ValueError("published run content mismatch")
+                        finally:
+                            os.close(public_fd)
                     finally:
                         os.close(run_fd)
-                    os.rename(run_id, run_id, src_dir_fd=tmp_fd, dst_dir_fd=day_fd)
-                    os.fsync(tmp_fd)
-                    os.fsync(day_fd)
-                    public_fd = _open_directory(run_id, dir_fd=day_fd)
-                    try:
-                        if set(os.listdir(public_fd)) != {
-                            "config-snapshot.json",
-                            "decision.json",
-                            "manifest.json",
-                        }:
-                            raise ValueError("published run artifact set mismatch")
-                        for name, expected_hash in manifest["files"].items():
-                            if (
-                                hashlib.sha256(_read_at(public_fd, name)).hexdigest()
-                                != expected_hash
-                            ):
-                                raise ValueError("published run hash mismatch")
-                    finally:
-                        os.close(public_fd)
                 finally:
                     os.close(day_fd)
                     os.close(tmp_fd)
@@ -327,4 +345,5 @@ class Orchestrator:
             final,
             strategy_version=V2_STRATEGY_VERSION,
             analysis_boundary=analysis_boundary,
+            manifest_sha256=hashlib.sha256(manifest_payload).hexdigest(),
         )

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import secrets
+import sqlite3
 import stat
 import sys
 from collections import Counter
@@ -13,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .config import config_hash
 from .pipeline.state_machine import GATES
 from .pipeline.v2_state_machine import V2_GATES, V2_STRATEGY_VERSION
 
@@ -315,6 +317,13 @@ def _eligible_cases(run: Path, manifest: dict, manifest_hash: str, payloads, has
     config = _decode(payloads["config-snapshot.json"], "config snapshot")
     if config.get("_config_hash") != manifest["config_hash"]:
         raise EvidenceError("config hash mismatch")
+    governed_config = dict(config)
+    governed_config.pop("_config_hash", None)
+    if (
+        manifest["schema_version"] == "2"
+        and config_hash(governed_config) != manifest["config_hash"]
+    ):
+        raise EvidenceError("config snapshot content hash mismatch")
     decision = _decode(payloads["decision.json"], "decision")
     if set(decision) != {"status", "symbols"} or decision["status"] not in _STATUSES:
         raise EvidenceError("invalid run decision")
@@ -384,6 +393,28 @@ def _eligible_cases(run: Path, manifest: dict, manifest_hash: str, payloads, has
     return cases
 
 
+def _validate_v2_claim(runs_root: Path, run: Path, manifest: dict, manifest_hash: str) -> None:
+    database = runs_root.parent / "data" / "market.sqlite3"
+    if not database.is_file():
+        raise EvidenceError("schema-v2 published claim database missing")
+    try:
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+            row = connection.execute(
+                """SELECT status,artifact_day,manifest_sha256
+                FROM analysis_claims
+                WHERE strategy_version=? AND analysis_boundary=? AND analysis_run_id=?""",
+                (
+                    manifest["strategy_version"],
+                    manifest["analysis_boundary"],
+                    manifest["analysis_run_id"],
+                ),
+            ).fetchone()
+    except sqlite3.Error as error:
+        raise EvidenceError("schema-v2 published claim unavailable") from error
+    if row != ("PUBLISHED", run.parent.name, manifest_hash):
+        raise EvidenceError("schema-v2 published claim mismatch")
+
+
 def build_casebook(runs_root: Path, milestone_target: int = 20) -> dict:
     if (
         isinstance(milestone_target, bool)
@@ -406,6 +437,9 @@ def build_casebook(runs_root: Path, milestone_target: int = 20) -> dict:
                     {"path": str(run.relative_to(runs_root)), "reason": "LEGACY_SCHEMA"}
                 )
                 continue
+            _strategy_contract(manifest)
+            if manifest.get("schema_version") == "2":
+                _validate_v2_claim(runs_root, run, manifest, manifest_hash)
             cases.extend(_eligible_cases(run, manifest, manifest_hash, payloads, hashes))
             eligible_runs += 1
     cases.sort(key=lambda row: (row["cutoff"], row["analysis_run_id"], row["symbol"]))
@@ -434,11 +468,7 @@ def build_casebook(runs_root: Path, milestone_target: int = 20) -> dict:
             "milestone_remaining": max(0, milestone_target - len(version_cases)),
             "milestone_reached": len(version_cases) >= milestone_target,
         }
-    active_strategy = (
-        V2_STRATEGY_VERSION
-        if V2_STRATEGY_VERSION in strategy_versions
-        else next(iter(strategy_versions), None)
-    )
+    active_strategy = V2_STRATEGY_VERSION
     active = strategy_versions.get(
         active_strategy,
         {

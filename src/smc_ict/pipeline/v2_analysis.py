@@ -37,34 +37,8 @@ def analyze_symbol_v2(snapshot, symbol: str, strategy) -> dict:
     bars60 = resample_bars(bars1, 60)
     results = {name: unavailable("upstream_gate_not_passed") for name in V2_GATES}
 
-    if not bars1440:
-        results["smc_1d_regime"] = unavailable("insufficient_1d_warmup")
-        return _finish(results)
-    results["smc_1d_regime"] = structure(bars1440, strategy)
-    if results["smc_1d_regime"].status != Status.PASS:
-        return _finish(results)
-
-    bias = Bias(results["smc_1d_regime"].value["bias"])
-    if bias != Bias.BULLISH:
-        results["smc_4h_structure"] = IndicatorResult(
-            Status.FAIL, {}, reason_codes=("v2_long_only",)
-        )
-        return _finish(results)
-    if not bars240 or not bars60:
-        results["smc_4h_structure"] = unavailable("insufficient_lower_timeframes")
-        return _finish(results)
-
-    results["smc_4h_structure"] = structure(bars240, strategy)
-    if results["smc_4h_structure"].status != Status.PASS:
-        return _finish(results)
-    if Bias(results["smc_4h_structure"].value["bias"]) != Bias.BULLISH:
-        results["smc_4h_structure"] = IndicatorResult(
-            Status.FAIL, {}, reason_codes=("4h_not_aligned_bullish",)
-        )
-        return _finish(results)
-
-    results["smc_4h_dealing_range"] = dealing(bars240, Bias.BULLISH)
-    if results["smc_4h_dealing_range"].status != Status.PASS:
+    if not bars1440 or not bars240 or not bars60:
+        results["smc_1d_regime"] = unavailable("insufficient_timeframe_warmup")
         return _finish(results)
 
     swings240 = confirmed_swings(bars240, strategy.swing_length)
@@ -83,19 +57,45 @@ def analyze_symbol_v2(snapshot, symbol: str, strategy) -> dict:
     )
     prior_lows = [s for s in swings240 if s.kind == "low" and s.known_index < break_index]
     impulse_start = prior_lows[-1].event_index if prior_lows else max(0, broken.event_index - 3)
-    results["smc_4h_order_block"] = order_block(
+    candidate_order_block = order_block(
         bars240, Bias.BULLISH, impulse_start=impulse_start, break_index=break_index
     )
-    if results["smc_4h_order_block"].status != Status.PASS:
+    if candidate_order_block.status != Status.PASS:
+        results["smc_4h_order_block"] = candidate_order_block
         return _finish(results)
 
-    poi_touch_4h = int(results["smc_4h_order_block"].value["first_touch_index"])
-    ob_low = Decimal(results["smc_4h_order_block"].value["low"])
-    ob_high = Decimal(results["smc_4h_order_block"].value["high"])
-    poi_known_at = results["smc_4h_order_block"].known_at
+    poi_touch_4h = int(candidate_order_block.value["first_touch_index"])
+    ob_low = Decimal(candidate_order_block.value["low"])
+    ob_high = Decimal(candidate_order_block.value["high"])
+    poi_known_at = candidate_order_block.known_at
     if poi_known_at is None:
         results["ict_1h_liquidity"] = unavailable("4h_poi_known_at_missing")
         return _finish(results)
+    causal_1d = tuple(bar for bar in bars1440 if bar.close_time <= poi_known_at)
+    causal_4h = bars240[: poi_touch_4h + 1]
+    if not causal_1d:
+        results["smc_1d_regime"] = unavailable("insufficient_1d_context_at_poi")
+        return _finish(results)
+    results["smc_1d_regime"] = structure(causal_1d, strategy)
+    if results["smc_1d_regime"].status != Status.PASS:
+        return _finish(results)
+    if Bias(results["smc_1d_regime"].value["bias"]) != Bias.BULLISH:
+        results["smc_4h_structure"] = IndicatorResult(
+            Status.FAIL, {}, reason_codes=("v2_long_only",)
+        )
+        return _finish(results)
+    results["smc_4h_structure"] = structure(causal_4h, strategy)
+    if results["smc_4h_structure"].status != Status.PASS:
+        return _finish(results)
+    if Bias(results["smc_4h_structure"].value["bias"]) != Bias.BULLISH:
+        results["smc_4h_structure"] = IndicatorResult(
+            Status.FAIL, {}, reason_codes=("4h_not_aligned_bullish",)
+        )
+        return _finish(results)
+    results["smc_4h_dealing_range"] = dealing(causal_4h, Bias.BULLISH)
+    if results["smc_4h_dealing_range"].status != Status.PASS:
+        return _finish(results)
+    results["smc_4h_order_block"] = candidate_order_block
     poi_touch_1h = first_zone_touch(bars60, ob_low, ob_high, after=poi_known_at)
     if poi_touch_1h is None:
         results["ict_1h_liquidity"] = unavailable("poi_touch_not_in_1h_snapshot")
@@ -162,7 +162,7 @@ def analyze_symbol_v2(snapshot, symbol: str, strategy) -> dict:
     entry = Decimal(results["ict_1h_fvg"].value["entry"])
     fill_index = _first_index_at_or_after(bars60, int(results["ict_1h_fvg"].known_at or 0))
     atr = _atr(bars60, fill_index or 0, strategy.atr_period)
-    target_swings = [s for s in swings240 if s.kind == "high" and s.known_index <= poi_touch_4h]
+    target_swings = [s for s in swings240 if s.kind == "high" and s.known_index < poi_touch_4h]
     if atr is None or not target_swings:
         results["risk"] = unavailable("insufficient_frozen_risk_reference")
         return _finish(results)

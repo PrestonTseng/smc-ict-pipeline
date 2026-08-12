@@ -36,22 +36,46 @@ def bars(minutes, count=40):
     )
 
 
+def _mock_poi_discovery(monkeypatch, module, aggregates):
+    monkeypatch.setattr(
+        module,
+        "confirmed_swings",
+        lambda source, length: (
+            Swing(2, 4, "low", Decimal("1")),
+            Swing(5, 7, "high", Decimal("6")),
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "order_block",
+        lambda *_args, **_kwargs: IndicatorResult(
+            Status.PASS,
+            {"low": "8", "high": "12", "origin_index": 3, "first_touch_index": 10},
+            aggregates[240][10].close_time,
+            aggregates[240][10].close_time,
+            ("first_touch_ob",),
+        ),
+    )
+
+
 def test_v2_uses_only_1d_4h_1h_aggregates(monkeypatch):
     import smc_ict.pipeline.v2_analysis as module
 
     calls = []
+    aggregates = {1440: bars(1440), 240: bars(240), 60: bars(60)}
 
     def resample(source, minutes):
         calls.append((source, minutes))
-        return (f"bars-{minutes}",)
+        return aggregates[minutes]
 
+    monkeypatch.setattr(module, "resample_bars", resample)
+    _mock_poi_discovery(monkeypatch, module, aggregates)
     structures = iter(
         [
             result(Status.PASS, Bias.BULLISH, ("bullish_bos",)),
             result(Status.FAIL, Bias.NEUTRAL, ("no_confirmed_bos",)),
         ]
     )
-    monkeypatch.setattr(module, "resample_bars", resample)
     monkeypatch.setattr(module, "structure", lambda bars, strategy: next(structures))
 
     analyzed = module.analyze_symbol_v2(Snapshot(), "BTCUSDT", StrategyConfig())
@@ -68,7 +92,9 @@ def test_v2_uses_only_1d_4h_1h_aggregates(monkeypatch):
 def test_v2_stops_at_unconfirmed_daily_regime(monkeypatch):
     import smc_ict.pipeline.v2_analysis as module
 
-    monkeypatch.setattr(module, "resample_bars", lambda source, minutes: (minutes,))
+    aggregates = {1440: bars(1440), 240: bars(240), 60: bars(60)}
+    monkeypatch.setattr(module, "resample_bars", lambda source, minutes: aggregates[minutes])
+    _mock_poi_discovery(monkeypatch, module, aggregates)
     monkeypatch.setattr(
         module,
         "structure",
@@ -92,7 +118,9 @@ def test_v2_stops_at_unconfirmed_daily_regime(monkeypatch):
 def test_v2_long_only_stops_after_bearish_daily_bos(monkeypatch):
     import smc_ict.pipeline.v2_analysis as module
 
-    monkeypatch.setattr(module, "resample_bars", lambda source, minutes: (minutes,))
+    aggregates = {1440: bars(1440), 240: bars(240), 60: bars(60)}
+    monkeypatch.setattr(module, "resample_bars", lambda source, minutes: aggregates[minutes])
+    _mock_poi_discovery(monkeypatch, module, aggregates)
     monkeypatch.setattr(
         module,
         "structure",
@@ -121,8 +149,18 @@ def test_v2_full_chain_executes_on_4h_poi_then_one_hour_timeline(monkeypatch):
             result(Status.PASS, Bias.BULLISH, ("bullish_bos",)),
         ]
     )
-    monkeypatch.setattr(module, "structure", lambda *_: next(structures))
-    monkeypatch.setattr(module, "dealing", lambda *_: result(Status.PASS))
+    observed_context_lengths = []
+
+    def causal_structure(source, _strategy):
+        observed_context_lengths.append(len(source))
+        return next(structures)
+
+    monkeypatch.setattr(module, "structure", causal_structure)
+    monkeypatch.setattr(
+        module,
+        "dealing",
+        lambda source, _bias: observed_context_lengths.append(len(source)) or result(Status.PASS),
+    )
     monkeypatch.setattr(
         module,
         "confirmed_swings",
@@ -190,3 +228,4 @@ def test_v2_full_chain_executes_on_4h_poi_then_one_hour_timeline(monkeypatch):
         "reason_codes": ["all_gates_passed"],
     }
     assert observed_after == [aggregates[240][10].close_time]
+    assert observed_context_lengths == [1, 11, 11]

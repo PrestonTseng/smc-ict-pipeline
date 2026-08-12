@@ -1,8 +1,12 @@
 import json
+import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
+from smc_ict.casebook import EvidenceError, build_casebook
 from smc_ict.config import AppConfig
 from smc_ict.data.binance import FixtureBinanceClient
 from smc_ict.pipeline.orchestrator import Orchestrator
@@ -145,4 +149,68 @@ def test_v2_dedup_rejects_duplicate_valid_boundary_runs(tmp_path: Path):
     second = orchestrator.analyze_latest()
 
     assert second.status == "FAILED"
-    assert second.error is not None and "duplicate v2 analysis boundary" in second.error
+    assert second.error is not None and "published claim mismatch" in second.error
+
+
+def _tamper_on_public_reopen(monkeypatch, tamper):
+    import smc_ict.pipeline.orchestrator as module
+
+    real_open = module._open_directory
+
+    def hooked(name, *, dir_fd=None):
+        if isinstance(name, str) and name.startswith("run-") and dir_fd is not None:
+            parent = Path(os.readlink(f"/proc/self/fd/{dir_fd}"))
+            if parent.name != ".tmp":
+                tamper(parent / name)
+        return real_open(name, dir_fd=dir_fd)
+
+    monkeypatch.setattr(module, "_open_directory", hooked)
+
+
+def test_publication_rejects_manifest_replacement_on_reopen(tmp_path: Path, monkeypatch):
+    _tamper_on_public_reopen(monkeypatch, lambda run: (run / "manifest.json").write_text("{}\n"))
+    result = Orchestrator(
+        AppConfig(data_root=tmp_path, bootstrap_bars=300), FixtureBinanceClient()
+    ).run_once()
+    assert result.status == "FAILED"
+    assert "published run content mismatch" in (result.error or "")
+
+
+def test_publication_rejects_fifo_without_blocking(tmp_path: Path, monkeypatch):
+    def replace_with_fifo(run: Path):
+        decision = run / "decision.json"
+        decision.unlink()
+        os.mkfifo(decision)
+
+    _tamper_on_public_reopen(monkeypatch, replace_with_fifo)
+    result = Orchestrator(
+        AppConfig(data_root=tmp_path, bootstrap_bars=300), FixtureBinanceClient()
+    ).run_once()
+    assert result.status == "FAILED"
+    assert "not a regular file" in (result.error or "")
+
+
+def test_post_publication_fsync_failure_artifact_is_not_casebook_evidence(
+    tmp_path: Path, monkeypatch
+):
+    import smc_ict.pipeline.orchestrator as module
+
+    real_fsync = module.os.fsync
+    calls = 0
+
+    def fail_final_directory_fsync(descriptor):
+        nonlocal calls
+        calls += 1
+        if calls == 7:
+            raise OSError("injected final runs fsync failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(module.os, "fsync", fail_final_directory_fsync)
+    result = Orchestrator(
+        AppConfig(data_root=tmp_path, bootstrap_bars=300), FixtureBinanceClient()
+    ).run_once()
+    assert result.status == "FAILED"
+    assert "final runs fsync" in (result.error or "")
+    assert list((tmp_path / "runs").glob("*/run-*"))
+    with pytest.raises(EvidenceError, match="published claim mismatch"):
+        build_casebook(tmp_path / "runs")

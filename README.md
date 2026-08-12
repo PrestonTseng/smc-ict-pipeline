@@ -90,6 +90,8 @@ Each module under `src/smc_ict/indicators/` is independent and returns a standar
 - first 1H FVG retracement
 - cost-adjusted structural risk
 
+The selected 4H POI touch is also the causal cutoff: the 1D regime and 4H context are recomputed only from bars complete by that touch, and structural target swings must have been known strictly before it. This prevents later higher-timeframe information from validating an earlier setup.
+
 Some pure indicator modules retain their historical v1 filenames; v2 passes
 only the documented 4H or 1H bars into those primitives. Artifact gate names
 and `strategy_version` are the public strategy contract.
@@ -126,6 +128,7 @@ decision SHA-256 values, per-indicator provenance, and aggregate decision
 consistency before emitting one observation row per eligible run and symbol.
 Legacy runs are verified and explicitly excluded rather than silently treated as
 forward evidence. `NO_SETUP` rows remain part of the denominator.
+Top-level active counts are always v2, including zero-v2 startup. Schema-v2 rows additionally require an exact repository `PUBLISHED` claim commitment to the run manifest; crash-left or unauthenticated directories fail closed.
 
 Case rows are observations, not automatically unique signals or trades. Review
 `unique_dataset_cutoffs` separately from `eligible_cases`; neither count proves

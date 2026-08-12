@@ -97,7 +97,7 @@ def test_scheduled_ingest_retries_lock_collision(tmp_path: Path):
         tmp_path,
         [
             '{"status":"SKIPPED_LOCKED"}',
-            '{"status":"COMMITTED","dataset_version":"ds-x"}',
+            '{"status":"COMMITTED","dataset_version":"ds-x","ingestion_run_id":"ingest-x"}',
         ],
     )
     env = os.environ | {
@@ -167,6 +167,28 @@ def test_scheduled_ingest_rejects_failed_or_unknown_success_receipt(tmp_path: Pa
         assert "invalid ingestion status" in result.stderr
         assert counter.read_text() == "1"
         assert not (case / "logs" / "ingestion.jsonl").exists()
+
+
+def test_scheduled_ingest_rejects_committed_receipt_without_identity(tmp_path: Path):
+    case = tmp_path / "missing-ingest-identity"
+    bin_dir, counter = _fake_uv(case, ['{"status":"COMMITTED"}'])
+    env = os.environ | {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "FAKE_UV_COUNTER": str(counter),
+        "FAKE_UV_RESPONSES": str(case / "responses"),
+        "SMC_ICT_LOG_DIR": str(case / "logs"),
+    }
+    result = subprocess.run(
+        ["bash", "scripts/scheduled-ingest.sh"],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "invalid ingestion identity" in result.stderr
+    assert not (case / "logs" / "ingestion.jsonl").exists()
 
 
 def test_scheduled_wrappers_reject_invalid_retry_configuration(tmp_path: Path):

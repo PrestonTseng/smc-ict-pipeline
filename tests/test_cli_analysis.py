@@ -37,6 +37,22 @@ def test_fixture_accepts_current_directory_data_root(tmp_path: Path, monkeypatch
     assert (tmp_path / "var-fixture" / "data" / "market.sqlite3").exists()
 
 
+def test_split_fixture_cli_ingests_then_analyzes_latest(tmp_path: Path, capsys):
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[app]\nbootstrap_bars=300\n[paths]\ndata_root="' + str(tmp_path / "var") + '"\n'
+    )
+    assert main(["ingest-once", "--config", str(config), "--fixture"]) == 0
+    ingested = json.loads(capsys.readouterr().out)
+    assert ingested["status"] == "COMMITTED"
+    assert ingested["analysis_run_id"] is None
+
+    assert main(["analyze-once", "--config", str(config), "--fixture"]) == 0
+    analyzed = json.loads(capsys.readouterr().out)
+    assert analyzed["dataset_version"] == ingested["dataset_version"]
+    assert analyzed["analysis_run_id"].startswith("run-")
+
+
 def test_analysis_emits_every_gate_from_one_snapshot(tmp_path: Path):
     client = FixtureBinanceClient()
     cutoff = client.latest_closed_cutoff()

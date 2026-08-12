@@ -32,6 +32,8 @@ uv run pytest
 uv run ruff check .
 uv run smc-ict run-once --config configs/default.toml --fixture
 uv run smc-ict run-once --config configs/default.toml
+uv run smc-ict ingest-once --config configs/default.toml
+uv run smc-ict analyze-once --config configs/default.toml
 ```
 
 A live run writes runtime data under `var/` by default:
@@ -47,14 +49,24 @@ deterministic test data can never share the live SQLite database.
 
 ## Scheduling
 
-Use one cron entry, not separate ingest and indicator jobs. The CLI acquires a non-blocking lock and does not run indicators before the full dataset transaction commits.
+Scheduled forward capture separates cadence from data grain. `ingest-once`
+fetches and atomically commits every missing closed 1m bar. `analyze-once`
+never fetches market data; it pins the latest committed dataset and publishes
+one immutable analysis run. Both commands share the same non-blocking process
+lock, so analysis cannot overlap ingestion.
 
 ```cron
-# Five minutes after every 5-minute boundary
-5-59/5 * * * * cd /path/to/smc-ict-pipeline && uv run smc-ict run-once --config configs/default.toml
+# Every minute: canonical closed 1m ingestion.
+* * * * * cd /path/to/smc-ict-pipeline && scripts/scheduled-ingest.sh
+# Every five minutes: analyze the latest pinned snapshot and rebuild casebook.
+2-59/5 * * * * cd /path/to/smc-ict-pipeline && scripts/scheduled-analysis.sh
+# Daily 10:00 in an Asia/Taipei scheduler: evidence-only human receipt.
+0 10 * * * cd /path/to/smc-ict-pipeline && scripts/daily-summary.py
 ```
 
-Capture stdout/stderr with your scheduler. `SKIPPED_LOCKED` is a safe no-op.
+`run-once` remains available for manual ingest→analyze compatibility. Scheduled
+wrappers log successful JSON receipts under ignored `var/logs/`; non-zero exits
+remain visible to the scheduler. `SKIPPED_LOCKED` is a safe no-op.
 
 ## Data guarantees
 

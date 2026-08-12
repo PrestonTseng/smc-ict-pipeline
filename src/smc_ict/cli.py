@@ -16,9 +16,10 @@ from .pipeline.orchestrator import Orchestrator
 def main(argv=None):
     p = argparse.ArgumentParser(prog="smc-ict")
     sub = p.add_subparsers(dest="command", required=True)
-    run = sub.add_parser("run-once")
-    run.add_argument("--config", type=Path)
-    run.add_argument("--fixture", action="store_true")
+    for command in ("run-once", "ingest-once", "analyze-once"):
+        run = sub.add_parser(command)
+        run.add_argument("--config", type=Path)
+        run.add_argument("--fixture", action="store_true")
     back = sub.add_parser("backup")
     back.add_argument("--source", type=Path, required=True)
     back.add_argument("--target", type=Path, required=True)
@@ -49,10 +50,23 @@ def main(argv=None):
             cfg,
             data_root=fixture_root,
         )
-    client = FixtureBinanceClient() if args.fixture else BinanceClient(timeout=cfg.request_timeout)
+    client = (
+        None
+        if args.command == "analyze-once"
+        else FixtureBinanceClient()
+        if args.fixture
+        else BinanceClient(timeout=cfg.request_timeout)
+    )
     try:
         with ProcessLock(cfg.data_root / "locks" / "run-once.lock"):
-            r = Orchestrator(cfg, client).run_once()
+            orchestrator = Orchestrator(cfg, client)
+            r = (
+                orchestrator.ingest_once()
+                if args.command == "ingest-once"
+                else orchestrator.analyze_latest()
+                if args.command == "analyze-once"
+                else orchestrator.run_once()
+            )
     except LockUnavailable:
         print(json.dumps({"status": "SKIPPED_LOCKED"}, sort_keys=True))
         return 0
@@ -61,6 +75,7 @@ def main(argv=None):
             {
                 "status": r.status,
                 "dataset_version": r.dataset_version,
+                "ingestion_run_id": r.ingestion_run_id,
                 "analysis_run_id": r.analysis_run_id,
                 "run_dir": str(r.run_dir) if r.run_dir else None,
                 "error": r.error,

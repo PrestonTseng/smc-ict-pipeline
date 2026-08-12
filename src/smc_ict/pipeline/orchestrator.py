@@ -38,6 +38,7 @@ def aggregate_status(results: dict) -> str:
 class RunResult:
     status: str
     dataset_version: str | None = None
+    ingestion_run_id: str | None = None
     analysis_run_id: str | None = None
     run_dir: Path | None = None
     error: str | None = None
@@ -50,6 +51,12 @@ class Orchestrator:
         self.analyzer = analyzer
 
     def run_once(self):
+        ingested = self.ingest_once()
+        if ingested.status == "FAILED":
+            return ingested
+        return self.analyze_latest()
+
+    def ingest_once(self):
         repo = MarketRepository(self.config.data_root / "data" / "market.sqlite3")
         ingestion_run_id = "ingest-" + uuid.uuid4().hex
         repo.start_ingestion(ingestion_run_id)
@@ -78,9 +85,24 @@ class Orchestrator:
                 )  # hard boundary: no analysis before this returns
         except Exception as e:
             repo.fail_ingestion(ingestion_run_id, f"{type(e).__name__}: {e}")
-            return RunResult("FAILED", error=f"{type(e).__name__}: {e}")
+            return RunResult(
+                "FAILED", ingestion_run_id=ingestion_run_id, error=f"{type(e).__name__}: {e}"
+            )
 
+        return RunResult("COMMITTED", version, ingestion_run_id=ingestion_run_id)
+
+    def analyze_latest(self):
+        latest: tuple[str, int] | None = None
+        ingestion_run_id: str | None = None
         try:
+            repo = MarketRepository(self.config.data_root / "data" / "market.sqlite3")
+            latest = repo.latest_committed()
+            if latest is None:
+                raise ValueError("no committed dataset")
+            version, cutoff = latest
+            ingestion_run_id = repo.committed_ingestion_for_dataset(version)
+            if ingestion_run_id is None:
+                raise ValueError("no committed ingestion for latest dataset cutoff")
             snap = repo.snapshot(version)
             results = {s: self.analyzer(snap, s, self.config.strategy) for s in self.config.symbols}
             config_digest = config_hash(self.config)
@@ -98,7 +120,12 @@ class Orchestrator:
                 config_digest,
             )
         except Exception as e:
-            return RunResult("FAILED", error=f"{type(e).__name__}: {e}")
+            return RunResult(
+                "FAILED",
+                dataset_version=latest[0] if latest else None,
+                ingestion_run_id=ingestion_run_id,
+                error=f"{type(e).__name__}: {e}",
+            )
 
     def _publish(self, ingestion_run_id, version, cutoff, results, dataset_checksum, config_digest):
         run_id = "run-" + uuid.uuid4().hex
@@ -137,4 +164,4 @@ class Orchestrator:
         (tmp / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
         base.mkdir(parents=True, exist_ok=True)
         os.rename(tmp, final)
-        return RunResult(run_status, version, run_id, final)
+        return RunResult(run_status, version, ingestion_run_id, run_id, final)

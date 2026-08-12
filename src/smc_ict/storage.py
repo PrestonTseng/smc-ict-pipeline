@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS ingestion_runs(
     ingestion_run_id TEXT PRIMARY KEY,
     status TEXT NOT NULL,
     cutoff INTEGER,
+    dataset_version TEXT REFERENCES datasets(version),
     error TEXT,
     started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     finished_at TEXT
@@ -58,6 +59,76 @@ class MarketRepository:
                 c.execute(
                     "ALTER TABLE datasets ADD COLUMN status TEXT NOT NULL DEFAULT 'COMMITTED'"
                 )
+            ingestion_columns = {row[1] for row in c.execute("PRAGMA table_info(ingestion_runs)")}
+            if "dataset_version" not in ingestion_columns:
+                c.execute(
+                    "ALTER TABLE ingestion_runs ADD COLUMN dataset_version "
+                    "TEXT REFERENCES datasets(version)"
+                )
+            schema_version = int(c.execute("PRAGMA user_version").fetchone()[0])
+            if schema_version < 1:
+                c.execute(
+                    """UPDATE ingestion_runs SET dataset_version=NULL
+                    WHERE dataset_version IS NOT NULL AND (
+                        status!='COMMITTED' OR NOT EXISTS (
+                            SELECT 1 FROM datasets d
+                            WHERE d.version=ingestion_runs.dataset_version
+                            AND d.status='COMMITTED' AND d.cutoff=ingestion_runs.cutoff
+                        ) OR ingestion_run_id != (
+                            SELECT MIN(origin.ingestion_run_id)
+                            FROM ingestion_runs origin
+                            WHERE origin.status='COMMITTED'
+                            AND origin.dataset_version=ingestion_runs.dataset_version
+                            AND origin.cutoff=ingestion_runs.cutoff
+                        )
+                    )"""
+                )
+                c.execute(
+                    """UPDATE ingestion_runs SET dataset_version=(
+                        SELECT MIN(version) FROM datasets
+                        WHERE datasets.cutoff=ingestion_runs.cutoff
+                        HAVING COUNT(*)=1
+                    ) WHERE status='COMMITTED' AND dataset_version IS NULL
+                    AND ingestion_run_id=(
+                        SELECT MIN(origin.ingestion_run_id) FROM ingestion_runs AS origin
+                        WHERE origin.status='COMMITTED'
+                        AND origin.cutoff=ingestion_runs.cutoff
+                    )"""
+                )
+            c.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS one_ingestion_origin_per_dataset
+                ON ingestion_runs(dataset_version)
+                WHERE dataset_version IS NOT NULL"""
+            )
+            index_rows = [
+                row
+                for row in c.execute("PRAGMA index_list(ingestion_runs)")
+                if row[1] == "one_ingestion_origin_per_dataset"
+            ]
+            index_columns = c.execute(
+                "PRAGMA index_info(one_ingestion_origin_per_dataset)"
+            ).fetchall()
+            index_sql_row = c.execute(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                ("one_ingestion_origin_per_dataset",),
+            ).fetchone()
+            normalized_sql = (
+                " ".join(str(index_sql_row[0]).upper().split()) if index_sql_row else ""
+            )
+            expected_sql = (
+                "CREATE UNIQUE INDEX ONE_INGESTION_ORIGIN_PER_DATASET "
+                "ON INGESTION_RUNS(DATASET_VERSION) WHERE DATASET_VERSION IS NOT NULL"
+            )
+            if (
+                len(index_rows) != 1
+                or index_rows[0][2] != 1
+                or index_rows[0][4] != 1
+                or [row[2] for row in index_columns] != ["dataset_version"]
+                or normalized_sql != expected_sql
+            ):
+                raise ValidationError("origin index contract mismatch")
+            if schema_version < 1:
+                c.execute("PRAGMA user_version=1")
 
     def _c(self):
         c = sqlite3.connect(self.path)
@@ -71,6 +142,17 @@ class MarketRepository:
                 ORDER BY committed_at DESC,rowid DESC LIMIT 1"""
             ).fetchone()
         return (str(row[0]), int(row[1])) if row else None
+
+    def committed_ingestion_for_dataset(self, dataset_version: str) -> str | None:
+        with self._c() as connection:
+            rows = connection.execute(
+                """SELECT i.ingestion_run_id FROM ingestion_runs i
+                JOIN datasets d ON d.version=i.dataset_version
+                WHERE i.status='COMMITTED' AND i.dataset_version=?
+                AND i.cutoff=d.cutoff AND d.status='COMMITTED'""",
+                (dataset_version,),
+            ).fetchall()
+        return str(rows[0][0]) if len(rows) == 1 else None
 
     def start_ingestion(self, ingestion_run_id: str, cutoff: int | None = None) -> None:
         with self._c() as connection:
@@ -98,8 +180,8 @@ class MarketRepository:
     def complete_ingestion(self, ingestion_run_id: str) -> None:
         with self._c() as connection:
             connection.execute(
-                """UPDATE ingestion_runs SET status='COMMITTED',finished_at=CURRENT_TIMESTAMP
-                WHERE ingestion_run_id=?""",
+                """UPDATE ingestion_runs SET status='COMMITTED',
+                finished_at=CURRENT_TIMESTAMP WHERE ingestion_run_id=?""",
                 (ingestion_run_id,),
             )
 
@@ -222,9 +304,9 @@ class MarketRepository:
                     raise ValidationError("merged snapshot gap or watermark mismatch")
             if ingestion_run_id is not None:
                 c.execute(
-                    """UPDATE ingestion_runs SET status='COMMITTED',finished_at=CURRENT_TIMESTAMP
-                    WHERE ingestion_run_id=?""",
-                    (ingestion_run_id,),
+                    """UPDATE ingestion_runs SET status='COMMITTED',dataset_version=?,
+                    finished_at=CURRENT_TIMESTAMP WHERE ingestion_run_id=?""",
+                    (version, ingestion_run_id),
                 )
         return version
 

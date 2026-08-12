@@ -1,0 +1,35 @@
+[project]
+name = "smc-ict-pipeline"
+version = "0.1.0"
+description = "Point-in-time-safe SMC context and ICT execution research pipeline with a versioned Binance SSOT"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+smc-ict = "smc_ict.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = ["E501"]
+
+[build-system]
+requires = ["uv_build>=0.11.6,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "smc_ict"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.2",
+]

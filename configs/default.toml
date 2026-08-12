@@ -1,0 +1,25 @@
+[app]
+symbols = ["BTCUSDT", "ETHUSDT"]
+bootstrap_bars = 43200
+overlap_bars = 5
+request_timeout = 20
+
+[paths]
+data_root = "var"
+
+[strategy]
+swing_length = 2
+poi_timeout_bars = 12
+displacement_window = 3
+displacement_lookback = 20
+displacement_body_multiple = "1.25"
+displacement_body_ratio = "0.70"
+displacement_close_edge = "0.20"
+fvg_wait_bars = 6
+fvg_entry_fraction = "0.50"
+atr_period = 14
+atr_buffer = "0.10"
+minimum_r = "2.0"
+fee_bps = "4"
+slippage_bps = "2"
+time_stop_hours = 6

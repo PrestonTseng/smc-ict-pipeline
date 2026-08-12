@@ -128,6 +128,31 @@ def test_scheduled_ingest_reports_persistent_lock_collision(tmp_path: Path):
     assert "remained locked" in result.stderr
 
 
+def test_scheduled_ingest_rejects_failed_or_unknown_success_receipt(tmp_path: Path):
+    for index, receipt in enumerate(('{"status":"FAILED","error":"boom"}', '{"status":"UNKNOWN"}')):
+        case = tmp_path / f"bad-ingest-status-{index}"
+        bin_dir, counter = _fake_uv(case, [receipt])
+        env = os.environ | {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "FAKE_UV_COUNTER": str(counter),
+            "FAKE_UV_RESPONSES": str(case / "responses"),
+            "SMC_ICT_RETRY_DELAY": "0",
+            "SMC_ICT_MAX_LOCK_ATTEMPTS": "3",
+            "SMC_ICT_LOG_DIR": str(case / "logs"),
+        }
+        result = subprocess.run(
+            ["bash", "scripts/scheduled-ingest.sh"],
+            cwd=Path(__file__).parents[1],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode != 0
+        assert "invalid ingestion status" in result.stderr
+        assert counter.read_text() == "1"
+
+
 def test_scheduled_wrappers_reject_invalid_retry_configuration(tmp_path: Path):
     for script in ("scheduled-ingest.sh", "scheduled-analysis.sh"):
         for index, (attempts, delay) in enumerate(

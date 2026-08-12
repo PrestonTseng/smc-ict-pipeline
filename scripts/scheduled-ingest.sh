@@ -31,4 +31,8 @@ for ((attempt = 1; attempt <= max_attempts; attempt++)); do
   fi
   sleep "$retry_delay"
 done
+if [[ "$status" != "COMMITTED" ]]; then
+  printf 'invalid ingestion status: %s\n' "$status" >&2
+  exit 1
+fi
 printf '%s %s\n' "$(date -u +%FT%TZ)" "$result" >> "$log_dir/ingestion.jsonl"

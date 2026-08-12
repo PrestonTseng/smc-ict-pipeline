@@ -9,9 +9,11 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..casebook import build_casebook
 from ..config import AppConfig, config_dict, config_hash
 from ..storage import MarketRepository
-from .analysis import analyze_symbol
+from .v2_analysis import analyze_symbol_v2
+from .v2_state_machine import V2_STRATEGY_VERSION
 
 
 def _source_version() -> str:
@@ -45,7 +47,7 @@ class RunResult:
 
 
 class Orchestrator:
-    def __init__(self, config: AppConfig, client, analyzer=analyze_symbol):
+    def __init__(self, config: AppConfig, client, analyzer=analyze_symbol_v2):
         self.config = config
         self.client = client
         self.analyzer = analyzer
@@ -100,6 +102,17 @@ class Orchestrator:
             if latest is None:
                 raise ValueError("no committed dataset")
             version, cutoff = latest
+            analysis_boundary = ((cutoff + 1) // 3_600_000) * 3_600_000 - 1
+            existing = self._existing_boundary_run(analysis_boundary)
+            if existing is not None:
+                run_dir, row = existing
+                return RunResult(
+                    "SKIPPED_ALREADY_ANALYZED",
+                    row["dataset_version"],
+                    row["ingestion_run_id"],
+                    row["analysis_run_id"],
+                    run_dir,
+                )
             ingestion_run_id = repo.committed_ingestion_for_dataset(version)
             if ingestion_run_id is None:
                 raise ValueError("no committed ingestion for latest dataset cutoff")
@@ -115,6 +128,7 @@ class Orchestrator:
                 ingestion_run_id,
                 version,
                 cutoff,
+                analysis_boundary,
                 results,
                 repo.dataset_checksum(version),
                 config_digest,
@@ -127,7 +141,41 @@ class Orchestrator:
                 error=f"{type(e).__name__}: {e}",
             )
 
-    def _publish(self, ingestion_run_id, version, cutoff, results, dataset_checksum, config_digest):
+    def _existing_boundary_run(self, analysis_boundary: int) -> tuple[Path, dict] | None:
+        runs_root = self.config.data_root / "runs"
+        if not runs_root.exists():
+            return None
+        casebook = build_casebook(runs_root)
+        rows = [
+            row
+            for row in casebook["cases"]
+            if row["strategy_version"] == V2_STRATEGY_VERSION
+            and row["analysis_boundary"] == analysis_boundary
+        ]
+        run_ids = {row["analysis_run_id"] for row in rows}
+        if len(run_ids) > 1:
+            raise ValueError("duplicate v2 analysis boundary")
+        if not rows:
+            return None
+        row = rows[0]
+        day = (
+            __import__("datetime")
+            .datetime.fromtimestamp(row["cutoff"] / 1000, __import__("datetime").timezone.utc)
+            .date()
+            .isoformat()
+        )
+        return runs_root / day / row["analysis_run_id"], row
+
+    def _publish(
+        self,
+        ingestion_run_id,
+        version,
+        cutoff,
+        analysis_boundary,
+        results,
+        dataset_checksum,
+        config_digest,
+    ):
         run_id = "run-" + uuid.uuid4().hex
         day = (
             "1970-01-01"
@@ -149,7 +197,9 @@ class Orchestrator:
         (tmp / "config-snapshot.json").write_text(json.dumps(cfg, sort_keys=True, indent=2) + "\n")
         (tmp / "decision.json").write_text(json.dumps(decision, sort_keys=True, indent=2) + "\n")
         manifest = {
-            "schema_version": "1",
+            "schema_version": "2",
+            "strategy_version": V2_STRATEGY_VERSION,
+            "analysis_boundary": analysis_boundary,
             "ingestion_run_id": ingestion_run_id,
             "analysis_run_id": run_id,
             "dataset_version": version,

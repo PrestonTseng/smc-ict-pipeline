@@ -57,6 +57,22 @@ def test_resample_requires_complete_utc_windows():
     assert resample_bars(bars(4), 5) == ()
 
 
+def test_resample_uses_utc_boundaries_not_input_offset():
+    source = bars(120, start=60_000)
+
+    result = resample_bars(source, 60)
+
+    assert len(result) == 1
+    assert result[0].open_time == 3_600_000
+    assert result[0].close_time == 7_199_999
+
+
+def test_resample_drops_gapped_utc_bucket_even_when_count_matches():
+    source = bars(59) + bars(1, start=3_600_000)
+
+    assert resample_bars(source, 60) == ()
+
+
 def test_commit_exception_rolls_back_dataset_and_mapping(tmp_path: Path):
     repo = MarketRepository(tmp_path / "m.db")
     batch = {"BTCUSDT": bars(), "ETHUSDT": bars(symbol="ETHUSDT")}

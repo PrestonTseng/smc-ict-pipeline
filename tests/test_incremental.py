@@ -60,7 +60,7 @@ def test_orchestrator_uses_overlap_after_bootstrap(tmp_path: Path):
     assert {start for _, start, _ in client.calls} == {300_000}
 
 
-def test_same_cutoff_reuses_dataset_but_publishes_new_analysis(tmp_path: Path):
+def test_same_cutoff_reuses_dataset_and_closed_hour_analysis(tmp_path: Path):
     cfg = AppConfig(data_root=tmp_path, bootstrap_bars=5, overlap_bars=2)
     client = RecordingClient()
     orchestrator = Orchestrator(cfg, client)
@@ -68,7 +68,9 @@ def test_same_cutoff_reuses_dataset_but_publishes_new_analysis(tmp_path: Path):
     client.calls.clear()
     second = orchestrator.run_once()
     assert second.dataset_version == first.dataset_version
-    assert second.analysis_run_id != first.analysis_run_id
+    assert second.status == "SKIPPED_ALREADY_ANALYZED"
+    assert second.analysis_run_id == first.analysis_run_id
+    assert len(list((tmp_path / "runs").glob("*/run-*"))) == 1
     assert client.calls == []
 
 

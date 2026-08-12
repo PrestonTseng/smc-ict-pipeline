@@ -9,6 +9,7 @@ import pytest
 from smc_ict.casebook import EvidenceError, build_casebook, publish_casebook, render_casebook
 from smc_ict.cli import main
 from smc_ict.pipeline.state_machine import GATES
+from smc_ict.pipeline.v2_state_machine import V2_GATES
 
 
 def _json_bytes(value):
@@ -16,7 +17,14 @@ def _json_bytes(value):
 
 
 def _write_run(
-    root: Path, run_id: str, cutoff: int, *, schema=True, symbol_order=("BTCUSDT", "ETHUSDT")
+    root: Path,
+    run_id: str,
+    cutoff: int,
+    *,
+    schema=True,
+    schema_version="1",
+    strategy_version=None,
+    symbol_order=("BTCUSDT", "ETHUSDT"),
 ):
     day = "2026-08-12"
     run = root / day / run_id
@@ -24,12 +32,14 @@ def _write_run(
     (run / "indicators").mkdir()
     config_hash = "a" * 64
     config = {"_config_hash": config_hash, "symbols": list(symbol_order)}
+    gates = V2_GATES if strategy_version == "v2-1d-4h-1h" else GATES
+    first_gate = gates[0]
     decision = {
         "status": "NO_SETUP",
         "symbols": {
             symbol: {
                 "decision": {
-                    "failed_gate": "smc_4h_structure",
+                    "failed_gate": first_gate,
                     "passed_gates": [],
                     "reason_codes": ["no_confirmed_bos"],
                     "status": "NO_SETUP",
@@ -41,13 +51,13 @@ def _write_run(
                         "input_hash": ("b" if symbol == "BTCUSDT" else "c") * 64,
                         "known_at": None,
                         "reason_codes": [
-                            "no_confirmed_bos" if gate == GATES[0] else "upstream_gate_not_passed"
+                            "no_confirmed_bos" if gate == first_gate else "upstream_gate_not_passed"
                         ],
                         "reference_levels": {},
-                        "status": "FAIL" if gate == GATES[0] else "UNAVAILABLE",
+                        "status": "FAIL" if gate == first_gate else "UNAVAILABLE",
                         "value": {},
                     }
-                    for gate in GATES
+                    for gate in gates
                 },
             }
             for symbol in symbol_order
@@ -70,7 +80,10 @@ def _write_run(
         "ingestion_run_id": "ingest-test",
     }
     if schema:
-        manifest["schema_version"] = "1"
+        manifest["schema_version"] = schema_version
+    if strategy_version is not None:
+        manifest["strategy_version"] = strategy_version
+        manifest["analysis_boundary"] = ((cutoff + 1) // 3_600_000) * 3_600_000 - 1
     (run / "manifest.json").write_bytes(_json_bytes(manifest))
     return run
 
@@ -101,6 +114,7 @@ def test_valid_runs_produce_deterministic_cases_and_summary(tmp_path: Path):
         "ineligible_runs": 0,
         "eligible_cases": 4,
         "unique_dataset_cutoffs": 1,
+        "strategy_versions": {"v1-4h-1h-5m": {"eligible_cases": 4, "unique_dataset_cutoffs": 1}},
         "status_counts": {"NO_SETUP": 4},
         "failed_gate_counts": {"smc_4h_structure": 4},
         "reason_counts": {"no_confirmed_bos": 4},
@@ -116,6 +130,44 @@ def test_valid_runs_produce_deterministic_cases_and_summary(tmp_path: Path):
     assert first["case_id"] == expected_id
     assert render_casebook(result).endswith(b"\n")
     assert render_casebook(result) == render_casebook(build_casebook(runs, milestone_target=20))
+
+
+def test_casebook_keeps_v1_and_v2_denominators_separate(tmp_path: Path):
+    runs = tmp_path / "runs"
+    _write_run(runs, "run-v1", 1_786_517_339_999)
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+
+    result = build_casebook(runs)
+
+    assert {row["strategy_version"] for row in result["cases"]} == {
+        "v1-4h-1h-5m",
+        "v2-1d-4h-1h",
+    }
+    v2_cases = [row for row in result["cases"] if row["strategy_version"] == "v2-1d-4h-1h"]
+    assert {row["analysis_boundary"] for row in v2_cases} == {1_786_517_999_999}
+    assert result["summary"]["strategy_versions"] == {
+        "v1-4h-1h-5m": {"eligible_cases": 2, "unique_dataset_cutoffs": 1},
+        "v2-1d-4h-1h": {"eligible_cases": 2, "unique_dataset_cutoffs": 1},
+    }
+
+
+def test_schema_v2_rejects_unknown_strategy_version(tmp_path: Path):
+    runs = tmp_path / "runs"
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="unknown",
+    )
+    with pytest.raises(EvidenceError, match="strategy_version"):
+        build_casebook(runs)
 
 
 def test_legacy_run_is_verified_then_excluded(tmp_path: Path):
@@ -224,7 +276,7 @@ def test_casebook_cli_publishes_machine_result(tmp_path: Path, capsys):
     ("mutation", "message"),
     [
         (lambda manifest: manifest.update(cutoff=True), "invalid cutoff"),
-        (lambda manifest: manifest.update(schema_version="2"), "unsupported schema_version"),
+        (lambda manifest: manifest.update(schema_version="2"), "schema-v2 manifest key mismatch"),
         (lambda manifest: manifest.update(extra="value"), "manifest key mismatch"),
     ],
 )

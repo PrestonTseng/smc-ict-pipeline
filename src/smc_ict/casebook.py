@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .pipeline.state_machine import GATES
+from .pipeline.v2_state_machine import V2_GATES, V2_STRATEGY_VERSION
 
 
 class EvidenceError(ValueError):
@@ -21,7 +22,7 @@ class EvidenceError(ValueError):
 
 
 _SHA256 = set("0123456789abcdef")
-_MANIFEST_KEYS = {
+_MANIFEST_KEYS_V1 = {
     "schema_version",
     "ingestion_run_id",
     "analysis_run_id",
@@ -32,6 +33,8 @@ _MANIFEST_KEYS = {
     "code_version",
     "files",
 }
+_MANIFEST_KEYS_V2 = _MANIFEST_KEYS_V1 | {"strategy_version", "analysis_boundary"}
+_V1_STRATEGY_VERSION = "v1-4h-1h-5m"
 _FILE_NAMES = {"config-snapshot.json", "decision.json"}
 _REQUIRED_RUN_ENTRIES = _FILE_NAMES | {"manifest.json"}
 _STATUSES = {"FAILED", "BLOCKED", "TRADE", "ORDER_PENDING", "ARMED", "NO_SETUP"}
@@ -176,11 +179,11 @@ def _string_list(value: Any, label: str) -> list[str]:
     return value
 
 
-def _expected_gate_decision(indicators: dict) -> dict:
-    if set(indicators) != set(GATES):
+def _expected_gate_decision(indicators: dict, gates: tuple[str, ...]) -> dict:
+    if set(indicators) != set(gates):
         raise EvidenceError("gate decision indicator set mismatch")
     passed = []
-    for gate in GATES:
+    for gate in gates:
         indicator = indicators[gate]
         if not isinstance(indicator, dict):
             raise EvidenceError("invalid indicator")
@@ -200,10 +203,10 @@ def _expected_gate_decision(indicators: dict) -> dict:
     return {"status": "TRADE", "passed_gates": passed, "reason_codes": ["all_gates_passed"]}
 
 
-def _validate_indicators(indicators: dict, config_hash: str) -> None:
-    if set(indicators) != set(GATES):
+def _validate_indicators(indicators: dict, config_hash: str, gates: tuple[str, ...]) -> None:
+    if set(indicators) != set(gates):
         raise EvidenceError("gate decision indicator set mismatch")
-    for gate in GATES:
+    for gate in gates:
         indicator = indicators[gate]
         if not isinstance(indicator, dict):
             raise EvidenceError("invalid indicator")
@@ -236,9 +239,22 @@ def _validate_indicators(indicators: dict, config_hash: str) -> None:
             raise EvidenceError("indicator reference_levels must map strings to strings")
 
 
+def _strategy_contract(manifest: dict) -> tuple[str, tuple[str, ...]]:
+    if manifest.get("schema_version") == "1":
+        if set(manifest) != _MANIFEST_KEYS_V1:
+            raise EvidenceError("schema-v1 manifest key mismatch")
+        return _V1_STRATEGY_VERSION, GATES
+    if manifest.get("schema_version") == "2":
+        if set(manifest) != _MANIFEST_KEYS_V2:
+            raise EvidenceError("schema-v2 manifest key mismatch")
+        if manifest.get("strategy_version") != V2_STRATEGY_VERSION:
+            raise EvidenceError("unsupported strategy_version")
+        return V2_STRATEGY_VERSION, V2_GATES
+    raise EvidenceError("unsupported schema_version")
+
+
 def _eligible_cases(run: Path, manifest: dict, manifest_hash: str, payloads, hashes):
-    if set(manifest) != _MANIFEST_KEYS:
-        raise EvidenceError("schema-v1 manifest key mismatch")
+    strategy_version, gates = _strategy_contract(manifest)
     for name in ("dataset_checksum", "config_hash", "code_version"):
         if not _is_hash(manifest[name]):
             raise EvidenceError(f"invalid manifest {name}")
@@ -248,6 +264,15 @@ def _eligible_cases(run: Path, manifest: dict, manifest_hash: str, payloads, has
     cutoff = manifest["cutoff"]
     if isinstance(cutoff, bool) or not isinstance(cutoff, int) or cutoff < 0:
         raise EvidenceError("invalid cutoff")
+    analysis_boundary = manifest.get("analysis_boundary")
+    if manifest["schema_version"] == "2":
+        expected_boundary = ((cutoff + 1) // 3_600_000) * 3_600_000 - 1
+        if (
+            isinstance(analysis_boundary, bool)
+            or not isinstance(analysis_boundary, int)
+            or analysis_boundary != expected_boundary
+        ):
+            raise EvidenceError("invalid analysis_boundary")
     if manifest["analysis_run_id"] != run.name:
         raise EvidenceError("analysis_run_id does not match run directory")
     expected_day = datetime.fromtimestamp(cutoff / 1000, UTC).date().isoformat()
@@ -293,14 +318,16 @@ def _eligible_cases(run: Path, manifest: dict, manifest_hash: str, payloads, has
         indicators = body.get("indicators")
         if not isinstance(indicators, dict) or not indicators:
             raise EvidenceError("invalid indicators")
-        _validate_indicators(indicators, manifest["config_hash"])
-        if symbol_decision != _expected_gate_decision(indicators):
+        _validate_indicators(indicators, manifest["config_hash"], gates)
+        if symbol_decision != _expected_gate_decision(indicators, gates):
             raise EvidenceError("gate decision does not match authoritative state machine")
         identity = _canonical([manifest["analysis_run_id"], symbol])
         cases.append(
             {
                 "case_id": hashlib.sha256(identity).hexdigest(),
                 "analysis_run_id": manifest["analysis_run_id"],
+                "strategy_version": strategy_version,
+                "analysis_boundary": analysis_boundary,
                 "symbol": symbol,
                 "cutoff": cutoff,
                 "run_status": decision["status"],
@@ -345,8 +372,6 @@ def build_casebook(runs_root: Path, milestone_target: int = 20) -> dict:
                     {"path": str(run.relative_to(runs_root)), "reason": "LEGACY_SCHEMA"}
                 )
                 continue
-            if manifest["schema_version"] != "1":
-                raise EvidenceError("unsupported schema_version")
             cases.extend(_eligible_cases(run, manifest, manifest_hash, payloads, hashes))
             eligible_runs += 1
     cases.sort(key=lambda row: (row["cutoff"], row["analysis_run_id"], row["symbol"]))
@@ -356,8 +381,17 @@ def build_casebook(runs_root: Path, milestone_target: int = 20) -> dict:
     )
     reason_counts = Counter(reason for row in cases for reason in row["reason_codes"])
     unique_dataset_cutoffs = len({(row["dataset_version"], row["cutoff"]) for row in cases})
+    strategy_versions = {}
+    for strategy_version in sorted({row["strategy_version"] for row in cases}):
+        version_cases = [row for row in cases if row["strategy_version"] == strategy_version]
+        strategy_versions[strategy_version] = {
+            "eligible_cases": len(version_cases),
+            "unique_dataset_cutoffs": len(
+                {(row["dataset_version"], row["cutoff"]) for row in version_cases}
+            ),
+        }
     return {
-        "schema_version": "1",
+        "schema_version": "2",
         "cases": cases,
         "exclusions": sorted(exclusions, key=lambda row: row["path"]),
         "summary": {
@@ -366,6 +400,7 @@ def build_casebook(runs_root: Path, milestone_target: int = 20) -> dict:
             "ineligible_runs": discovered_runs - eligible_runs,
             "eligible_cases": len(cases),
             "unique_dataset_cutoffs": unique_dataset_cutoffs,
+            "strategy_versions": strategy_versions,
             "status_counts": dict(sorted(status_counts.items())),
             "failed_gate_counts": dict(sorted(failed_gate_counts.items())),
             "reason_counts": dict(sorted(reason_counts.items())),

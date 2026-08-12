@@ -14,20 +14,22 @@ def test_end_to_end_publishes_after_commit_and_never_overwrites(tmp_path: Path):
     o = Orchestrator(cfg, FixtureBinanceClient())
     first = o.run_once()
     second = o.run_once()
-    assert first.dataset_version and first.analysis_run_id != second.analysis_run_id
+    assert first.dataset_version and first.analysis_run_id == second.analysis_run_id
+    assert second.status == "SKIPPED_ALREADY_ANALYZED"
     assert first.run_dir.exists() and second.run_dir.exists()
     m = json.loads((first.run_dir / "manifest.json").read_text())
     assert m["dataset_version"] == first.dataset_version
     assert (first.run_dir / "decision.json").exists()
     decision = json.loads((first.run_dir / "decision.json").read_text())
     assert set(decision["symbols"]["BTCUSDT"]["indicators"]) == {
+        "smc_1d_regime",
         "smc_4h_structure",
-        "smc_1h_dealing_range",
-        "smc_1h_order_block",
-        "ict_5m_liquidity",
-        "ict_5m_displacement",
-        "ict_5m_mss",
-        "ict_5m_fvg",
+        "smc_4h_dealing_range",
+        "smc_4h_order_block",
+        "ict_1h_liquidity",
+        "ict_1h_displacement",
+        "ict_1h_mss",
+        "ict_1h_fvg",
         "risk",
     }
     assert m["cutoff"] == 17_999_999

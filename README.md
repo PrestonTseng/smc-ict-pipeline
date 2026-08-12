@@ -42,6 +42,8 @@ var/runs/YYYY-MM-DD/<analysis-run-id>/
 ```
 
 Runtime files are ignored by Git.
+Fixture runs use the sibling `var-fixture/` root (or `<configured-root>-fixture`) so
+deterministic test data can never share the live SQLite database.
 
 ## Scheduling
 

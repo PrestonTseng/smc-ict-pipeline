@@ -18,6 +18,23 @@ def test_toml_config_and_fixture_cli(tmp_path: Path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] in {"NO_SETUP", "ARMED", "ORDER_PENDING", "TRADE"}
     assert payload["dataset_version"].startswith("ds-")
+    assert (tmp_path / "var-fixture" / "data" / "market.sqlite3").exists()
+    assert not (tmp_path / "var" / "data" / "market.sqlite3").exists()
+
+
+def test_default_fixture_is_isolated_from_live_data_root(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert main(["run-once", "--fixture"]) == 0
+    assert (tmp_path / "var-fixture" / "data" / "market.sqlite3").exists()
+    assert not (tmp_path / "var" / "data" / "market.sqlite3").exists()
+
+
+def test_fixture_accepts_current_directory_data_root(tmp_path: Path, monkeypatch):
+    config = tmp_path / "config.toml"
+    config.write_text('[app]\nbootstrap_bars=300\n[paths]\ndata_root="."\n')
+    monkeypatch.chdir(tmp_path)
+    assert main(["run-once", "--config", str(config), "--fixture"]) == 0
+    assert (tmp_path / "var-fixture" / "data" / "market.sqlite3").exists()
 
 
 def test_analysis_emits_every_gate_from_one_snapshot(tmp_path: Path):

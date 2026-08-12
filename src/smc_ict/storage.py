@@ -103,6 +103,21 @@ class MarketRepository:
                 (ingestion_run_id,),
             )
 
+    @staticmethod
+    def _row_hash(bar: Bar) -> str:
+        canonical = [
+            bar.symbol,
+            bar.open_time,
+            bar.close_time,
+            str(bar.open),
+            str(bar.high),
+            str(bar.low),
+            str(bar.close),
+            str(bar.volume),
+            bar.is_closed,
+        ]
+        return hashlib.sha256(json.dumps(canonical, separators=(",", ":")).encode()).hexdigest()
+
     def commit_dataset(
         self,
         batch: dict[str, list[Bar]],
@@ -117,9 +132,12 @@ class MarketRepository:
             if not rows or any(
                 b.symbol != symbol
                 or not b.is_closed
+                or b.open_time % 60_000 != 0
+                or b.close_time != b.open_time + 59_999
                 or b.close_time > cutoff
                 or b.high < max(b.open, b.close)
                 or b.low > min(b.open, b.close)
+                or b.low > b.high
                 or b.volume < 0
                 for b in rows
             ):
@@ -133,19 +151,40 @@ class MarketRepository:
         version = "ds-" + uuid.uuid4().hex
         with self._c() as c:
             c.execute("BEGIN IMMEDIATE")
+            latest = c.execute(
+                """SELECT version,cutoff FROM datasets WHERE status='COMMITTED'
+                ORDER BY committed_at DESC,rowid DESC LIMIT 1"""
+            ).fetchone()
+            if base_version is None and latest is not None:
+                raise ValidationError("non-empty repository requires latest base version")
+            if base_version is not None:
+                base = c.execute(
+                    "SELECT cutoff,status FROM datasets WHERE version=?",
+                    (base_version,),
+                ).fetchone()
+                if base is None or base[1] != "COMMITTED":
+                    raise ValidationError("base version missing or not committed")
+                if latest is None or latest[0] != base_version:
+                    raise ValidationError("base version is not latest committed")
+                if int(base[0]) > cutoff:
+                    raise ValidationError("base version is newer than cutoff")
+                base_last_open = int(base[0]) - 59_999
+                if any(
+                    min(row.open_time for row in rows) > base_last_open for rows in batch.values()
+                ):
+                    raise ValidationError("incremental batch requires overlap with base version")
             c.execute("INSERT INTO datasets(version,cutoff) VALUES (?,?)", (version, cutoff))
             if base_version is not None:
                 c.execute(
                     """INSERT INTO dataset_bars(version,symbol,open_time,row_hash)
-                    SELECT ?,symbol,open_time,row_hash FROM dataset_bars WHERE version=?""",
-                    (version, base_version),
+                    SELECT ?,symbol,open_time,row_hash FROM dataset_bars
+                    WHERE version=? AND open_time<=?""",
+                    (version, base_version, cutoff - 59_999),
                 )
             for symbol, rows in batch.items():
                 for b in rows:
                     vals = [str(x) for x in (b.open, b.high, b.low, b.close, b.volume)]
-                    rh = hashlib.sha256(
-                        json.dumps([symbol, b.open_time, *vals], separators=(",", ":")).encode()
-                    ).hexdigest()
+                    rh = self._row_hash(b)
                     c.execute(
                         "INSERT OR IGNORE INTO bars VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                         (symbol, b.open_time, b.close_time, *vals, 1, rh, version),
@@ -154,6 +193,22 @@ class MarketRepository:
                         "INSERT OR REPLACE INTO dataset_bars VALUES (?,?,?,?)",
                         (version, symbol, b.open_time, rh),
                     )
+            for symbol in sorted(batch):
+                merged = c.execute(
+                    """SELECT d.open_time,b.close_time FROM dataset_bars d JOIN bars b
+                    ON b.symbol=d.symbol AND b.open_time=d.open_time AND b.row_hash=d.row_hash
+                    WHERE d.version=? AND d.symbol=? ORDER BY d.open_time""",
+                    (version, symbol),
+                ).fetchall()
+                if (
+                    not merged
+                    or merged[-1][1] != cutoff
+                    or any(
+                        right[0] - left[0] != 60_000
+                        for left, right in zip(merged, merged[1:], strict=False)
+                    )
+                ):
+                    raise ValidationError("merged snapshot gap or watermark mismatch")
             if ingestion_run_id is not None:
                 c.execute(
                     """UPDATE ingestion_runs SET status='COMMITTED',finished_at=CURRENT_TIMESTAMP
@@ -169,11 +224,17 @@ class MarketRepository:
     def dataset_checksum(self, version: str) -> str:
         with self._c() as connection:
             rows = connection.execute(
-                """SELECT symbol,open_time,row_hash FROM dataset_bars
-                WHERE version=? ORDER BY symbol,open_time""",
+                """SELECT b.symbol,b.open_time,b.close_time,b.o,b.h,b.l,b.c,b.v,b.closed
+                FROM dataset_bars d JOIN bars b
+                  ON b.symbol=d.symbol AND b.open_time=d.open_time AND b.row_hash=d.row_hash
+                WHERE d.version=? ORDER BY b.symbol,b.open_time""",
                 (version,),
             ).fetchall()
-        payload = json.dumps(rows, separators=(",", ":"), ensure_ascii=True).encode()
+        canonical = [
+            [symbol, open_time, close_time, o, h, low, close, volume, bool(closed)]
+            for symbol, open_time, close_time, o, h, low, close, volume, closed in rows
+        ]
+        payload = json.dumps(canonical, separators=(",", ":"), ensure_ascii=True).encode()
         return hashlib.sha256(payload).hexdigest()
 
     def snapshot(self, version):

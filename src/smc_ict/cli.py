@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from .backup import backup_database
@@ -25,6 +26,16 @@ def main(argv=None):
         print(json.dumps(backup_database(args.source, args.target), sort_keys=True))
         return 0
     cfg = load_config(args.config)
+    if args.fixture:
+        fixture_root = (
+            cfg.data_root.with_name(f"{cfg.data_root.name}-fixture")
+            if cfg.data_root.name
+            else cfg.data_root / "var-fixture"
+        )
+        cfg = replace(
+            cfg,
+            data_root=fixture_root,
+        )
     client = FixtureBinanceClient() if args.fixture else BinanceClient(timeout=cfg.request_timeout)
     try:
         with ProcessLock(cfg.data_root / "locks" / "run-once.lock"):

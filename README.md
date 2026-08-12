@@ -87,6 +87,10 @@ Backup is explicit and not on the signal path:
 uv run smc-ict backup --source var/data/market.sqlite3 --target var/backups/market.sqlite3
 ```
 
+Backups to the same target are serialized with a persistent sibling lock file;
+an overlapping invocation fails closed instead of publishing a stale manifest.
+Do not remove the `.lock` file while a backup may be running.
+
 The command uses SQLite's online backup API and reports SHA-256 plus `PRAGMA integrity_check`.
 
 ## Configuration governance

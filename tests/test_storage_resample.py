@@ -108,6 +108,24 @@ def test_incremental_merge_gap_rolls_back(tmp_path: Path):
     assert repo.latest_committed() == (version, 299_999)
 
 
+def test_incremental_merge_rejects_cross_symbol_leading_lineage_mismatch(tmp_path: Path):
+    repo = MarketRepository(tmp_path / "m.db")
+    base = {"BTCUSDT": bars(), "ETHUSDT": bars(symbol="ETHUSDT")}
+    version = repo.commit_dataset(base, 299_999)
+    with repo._c() as connection:
+        connection.execute(
+            "DELETE FROM dataset_bars WHERE version=? AND symbol='BTCUSDT' AND open_time=0",
+            (version,),
+        )
+    overlapping = {
+        "BTCUSDT": bars(3, start=240_000),
+        "ETHUSDT": bars(3, start=240_000, symbol="ETHUSDT"),
+    }
+    with pytest.raises(ValidationError, match="lineage start"):
+        repo.commit_dataset(overlapping, 419_999, base_version=version)
+    assert repo.latest_committed() == (version, 299_999)
+
+
 def test_base_version_must_exist_and_not_be_from_future(tmp_path: Path):
     repo = MarketRepository(tmp_path / "m.db")
     with pytest.raises(ValidationError, match="base version"):

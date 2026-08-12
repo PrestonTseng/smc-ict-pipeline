@@ -168,6 +168,17 @@ class MarketRepository:
                     raise ValidationError("base version is not latest committed")
                 if int(base[0]) > cutoff:
                     raise ValidationError("base version is newer than cutoff")
+                lineage_starts = c.execute(
+                    """SELECT symbol,MIN(open_time) FROM dataset_bars
+                    WHERE version=? GROUP BY symbol ORDER BY symbol""",
+                    (base_version,),
+                ).fetchall()
+                if (
+                    len(lineage_starts) != len(batch)
+                    or {row[0] for row in lineage_starts} != set(batch)
+                    or len({row[1] for row in lineage_starts}) != 1
+                ):
+                    raise ValidationError("base version lineage start mismatch")
                 base_last_open = int(base[0]) - 59_999
                 if any(
                     min(row.open_time for row in rows) > base_last_open for rows in batch.values()

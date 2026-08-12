@@ -19,7 +19,7 @@ Strict long-only fail-fast order:
 2. `smc_4h_structure`: close-confirmed bullish BOS aligned with 1D.
 3. `smc_4h_dealing_range`: latest 4H close lies in discount.
 4. `smc_4h_order_block`: latest directional candle before confirmed 4H BOS is unmitigated and receives its first post-break touch.
-5. `ict_1h_liquidity`: after the 4H POI touch, breach and reclaim a pre-existing confirmed 1H swing low.
+5. `ict_1h_liquidity`: strictly after the 4H POI touch bar has closed (`order_block.known_at`), breach and reclaim a pre-existing confirmed 1H swing low; never search inside the still-forming 4H touch bar.
 6. `ict_1h_displacement`: qualifying bullish displacement within the configured post-sweep window.
 7. `ict_1h_mss`: displacement closes above the opposing 1H swing high frozen before the sweep.
 8. `ict_1h_fvg`: first bullish FVG retraces to its configured 50% entry within the wait window.

@@ -33,7 +33,7 @@
 
 - [ ] Write parametrized RED tests proving exact gate order, complete local 1440/240/60 aggregation, closed-bar behavior, daily/4H alignment, long-only rejection, frozen references, event ordering, and fail-fast downstream `UNAVAILABLE` states.
 - [ ] Run `uv run pytest tests/test_v2_state_machine.py tests/test_v2_analysis.py -q` and verify failures are missing v2 modules/symbols.
-- [ ] Implement the minimum v2 state machine and analyzer using confirmed swings and existing pure indicator functions.
+- [ ] Implement the minimum v2 state machine and analyzer using confirmed swings and existing pure indicator functions; 1H execution must begin only after the 4H POI touch is known at the 4H close.
 - [ ] Rerun focused tests and `uv run pytest -q`.
 
 ### Task 2: Version immutable artifacts and casebook cohorts

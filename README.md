@@ -93,6 +93,28 @@ Do not remove the `.lock` file while a backup may be running.
 
 The command uses SQLite's online backup API and reports SHA-256 plus `PRAGMA integrity_check`.
 
+## Point-in-time casebook
+
+Build a deterministic research casebook from verified immutable runs:
+
+```bash
+uv run smc-ict casebook \
+  --runs-root var/runs \
+  --output var/evidence/casebook.json \
+  --milestone-target 20
+```
+
+The reader verifies the exact run artifact set, manifest identities, config and
+decision SHA-256 values, per-indicator provenance, and aggregate decision
+consistency before emitting one observation row per eligible run and symbol.
+Legacy runs are verified and explicitly excluded rather than silently treated as
+forward evidence. `NO_SETUP` rows remain part of the denominator.
+
+Case rows are observations, not automatically unique signals or trades. Review
+`unique_dataset_cutoffs` separately from `eligible_cases`; neither count proves
+profitability. This command creates no orders, computes no PnL, changes no
+strategy parameters, and does not enable scheduling or promotion.
+
 ## Configuration governance
 
 `configs/default.toml` contains all tunable values. Every run freezes the resolved configuration and hash. Daily review should create a candidate config; do not silently rewrite evidence from prior runs.

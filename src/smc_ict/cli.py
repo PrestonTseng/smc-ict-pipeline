@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .backup import backup_database
+from .casebook import publish_casebook
 from .config import load_config
 from .data.binance import BinanceClient, FixtureBinanceClient
 from .lock import LockUnavailable, ProcessLock
@@ -21,9 +22,21 @@ def main(argv=None):
     back = sub.add_parser("backup")
     back.add_argument("--source", type=Path, required=True)
     back.add_argument("--target", type=Path, required=True)
+    casebook = sub.add_parser("casebook")
+    casebook.add_argument("--runs-root", type=Path, required=True)
+    casebook.add_argument("--output", type=Path, required=True)
+    casebook.add_argument("--milestone-target", type=int, default=20)
     args = p.parse_args(argv)
     if args.command == "backup":
         print(json.dumps(backup_database(args.source, args.target), sort_keys=True))
+        return 0
+    if args.command == "casebook":
+        print(
+            json.dumps(
+                publish_casebook(args.runs_root, args.output, args.milestone_target),
+                sort_keys=True,
+            )
+        )
         return 0
     cfg = load_config(args.config)
     if args.fixture:

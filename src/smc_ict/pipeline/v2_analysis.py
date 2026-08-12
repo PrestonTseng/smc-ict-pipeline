@@ -92,7 +92,11 @@ def analyze_symbol_v2(snapshot, symbol: str, strategy) -> dict:
     poi_touch_4h = int(results["smc_4h_order_block"].value["first_touch_index"])
     ob_low = Decimal(results["smc_4h_order_block"].value["low"])
     ob_high = Decimal(results["smc_4h_order_block"].value["high"])
-    poi_touch_1h = first_zone_touch(bars60, ob_low, ob_high, after=bars240[break_index].close_time)
+    poi_known_at = results["smc_4h_order_block"].known_at
+    if poi_known_at is None:
+        results["ict_1h_liquidity"] = unavailable("4h_poi_known_at_missing")
+        return _finish(results)
+    poi_touch_1h = first_zone_touch(bars60, ob_low, ob_high, after=poi_known_at)
     if poi_touch_1h is None:
         results["ict_1h_liquidity"] = unavailable("poi_touch_not_in_1h_snapshot")
         return _finish(results)

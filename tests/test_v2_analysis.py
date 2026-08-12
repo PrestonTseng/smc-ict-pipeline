@@ -143,7 +143,13 @@ def test_v2_full_chain_executes_on_4h_poi_then_one_hour_timeline(monkeypatch):
             ("first_touch_ob",),
         ),
     )
-    monkeypatch.setattr(module, "first_zone_touch", lambda *_args, **_kwargs: 10)
+    observed_after = []
+
+    def touch(*_args, **kwargs):
+        observed_after.append(kwargs["after"])
+        return 10
+
+    monkeypatch.setattr(module, "first_zone_touch", touch)
     monkeypatch.setattr(
         module,
         "liquidity",
@@ -183,3 +189,4 @@ def test_v2_full_chain_executes_on_4h_poi_then_one_hour_timeline(monkeypatch):
         "passed_gates": list(module.V2_GATES),
         "reason_codes": ["all_gates_passed"],
     }
+    assert observed_after == [aggregates[240][10].close_time]

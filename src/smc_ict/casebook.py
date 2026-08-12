@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import secrets
+import sqlite3
 import stat
 import sys
 from collections import Counter
@@ -13,7 +14,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .config import config_hash
 from .pipeline.state_machine import GATES
+from .pipeline.v2_state_machine import V2_GATES, V2_STRATEGY_VERSION
 
 
 class EvidenceError(ValueError):
@@ -21,7 +24,7 @@ class EvidenceError(ValueError):
 
 
 _SHA256 = set("0123456789abcdef")
-_MANIFEST_KEYS = {
+_MANIFEST_KEYS_V1 = {
     "schema_version",
     "ingestion_run_id",
     "analysis_run_id",
@@ -32,6 +35,8 @@ _MANIFEST_KEYS = {
     "code_version",
     "files",
 }
+_MANIFEST_KEYS_V2 = _MANIFEST_KEYS_V1 | {"strategy_version", "analysis_boundary"}
+_V1_STRATEGY_VERSION = "v1-4h-1h-5m"
 _FILE_NAMES = {"config-snapshot.json", "decision.json"}
 _REQUIRED_RUN_ENTRIES = _FILE_NAMES | {"manifest.json"}
 _STATUSES = {"FAILED", "BLOCKED", "TRADE", "ORDER_PENDING", "ARMED", "NO_SETUP"}
@@ -151,7 +156,11 @@ def _verify_hashes(
         raise EvidenceError("run artifact set mismatch")
     if "indicators" in entries:
         indicators_fd = _open_directory("indicators", dir_fd=run_fd)
-        os.close(indicators_fd)
+        try:
+            if _directory_entries(indicators_fd):
+                raise EvidenceError("indicators directory must be empty")
+        finally:
+            os.close(indicators_fd)
     declared = manifest.get("files")
     if not isinstance(declared, dict) or set(declared) != _FILE_NAMES:
         raise EvidenceError("manifest files must name exact artifact set")
@@ -176,11 +185,11 @@ def _string_list(value: Any, label: str) -> list[str]:
     return value
 
 
-def _expected_gate_decision(indicators: dict) -> dict:
-    if set(indicators) != set(GATES):
+def _expected_gate_decision(indicators: dict, gates: tuple[str, ...]) -> dict:
+    if set(indicators) != set(gates):
         raise EvidenceError("gate decision indicator set mismatch")
     passed = []
-    for gate in GATES:
+    for gate in gates:
         indicator = indicators[gate]
         if not isinstance(indicator, dict):
             raise EvidenceError("invalid indicator")
@@ -200,10 +209,15 @@ def _expected_gate_decision(indicators: dict) -> dict:
     return {"status": "TRADE", "passed_gates": passed, "reason_codes": ["all_gates_passed"]}
 
 
-def _validate_indicators(indicators: dict, config_hash: str) -> None:
-    if set(indicators) != set(GATES):
+def _validate_indicators(
+    indicators: dict,
+    config_hash: str,
+    gates: tuple[str, ...],
+    timestamp_limit: int,
+) -> None:
+    if set(indicators) != set(gates):
         raise EvidenceError("gate decision indicator set mismatch")
-    for gate in GATES:
+    for gate in gates:
         indicator = indicators[gate]
         if not isinstance(indicator, dict):
             raise EvidenceError("invalid indicator")
@@ -229,6 +243,30 @@ def _validate_indicators(indicators: dict, config_hash: str) -> None:
             raise EvidenceError("indicator event_time and known_at must be paired")
         if event_time is not None and known_at < event_time:
             raise EvidenceError("indicator known_at precedes event_time")
+        if event_time is not None:
+            assert known_at is not None
+            if event_time > timestamp_limit or known_at > timestamp_limit:
+                raise EvidenceError("indicator timestamp exceeds analysis boundary")
+            timeframe_ms = {
+                "smc_1d_regime": 86_400_000,
+                "smc_4h_structure": 14_400_000,
+                "smc_4h_dealing_range": 14_400_000,
+                "smc_4h_order_block": 14_400_000,
+                "smc_1h_dealing_range": 3_600_000,
+                "smc_1h_order_block": 3_600_000,
+                "ict_1h_liquidity": 3_600_000,
+                "ict_1h_displacement": 3_600_000,
+                "ict_1h_mss": 3_600_000,
+                "ict_1h_fvg": 3_600_000,
+                "ict_5m_liquidity": 300_000,
+                "ict_5m_displacement": 300_000,
+                "ict_5m_mss": 300_000,
+                "ict_5m_fvg": 300_000,
+            }.get(gate)
+            if timeframe_ms is not None and (
+                (event_time + 1) % timeframe_ms != 0 or (known_at + 1) % timeframe_ms != 0
+            ):
+                raise EvidenceError("indicator timestamp is not timeframe-close aligned")
         levels = indicator.get("reference_levels")
         if not isinstance(levels, dict) or any(
             not isinstance(key, str) or not isinstance(value, str) for key, value in levels.items()
@@ -236,9 +274,22 @@ def _validate_indicators(indicators: dict, config_hash: str) -> None:
             raise EvidenceError("indicator reference_levels must map strings to strings")
 
 
+def _strategy_contract(manifest: dict) -> tuple[str, tuple[str, ...]]:
+    if manifest.get("schema_version") == "1":
+        if set(manifest) != _MANIFEST_KEYS_V1:
+            raise EvidenceError("schema-v1 manifest key mismatch")
+        return _V1_STRATEGY_VERSION, GATES
+    if manifest.get("schema_version") == "2":
+        if set(manifest) != _MANIFEST_KEYS_V2:
+            raise EvidenceError("schema-v2 manifest key mismatch")
+        if manifest.get("strategy_version") != V2_STRATEGY_VERSION:
+            raise EvidenceError("unsupported strategy_version")
+        return V2_STRATEGY_VERSION, V2_GATES
+    raise EvidenceError("unsupported schema_version")
+
+
 def _eligible_cases(run: Path, manifest: dict, manifest_hash: str, payloads, hashes):
-    if set(manifest) != _MANIFEST_KEYS:
-        raise EvidenceError("schema-v1 manifest key mismatch")
+    strategy_version, gates = _strategy_contract(manifest)
     for name in ("dataset_checksum", "config_hash", "code_version"):
         if not _is_hash(manifest[name]):
             raise EvidenceError(f"invalid manifest {name}")
@@ -248,6 +299,15 @@ def _eligible_cases(run: Path, manifest: dict, manifest_hash: str, payloads, has
     cutoff = manifest["cutoff"]
     if isinstance(cutoff, bool) or not isinstance(cutoff, int) or cutoff < 0:
         raise EvidenceError("invalid cutoff")
+    analysis_boundary = manifest.get("analysis_boundary")
+    if manifest["schema_version"] == "2":
+        expected_boundary = ((cutoff + 1) // 3_600_000) * 3_600_000 - 1
+        if (
+            isinstance(analysis_boundary, bool)
+            or not isinstance(analysis_boundary, int)
+            or analysis_boundary != expected_boundary
+        ):
+            raise EvidenceError("invalid analysis_boundary")
     if manifest["analysis_run_id"] != run.name:
         raise EvidenceError("analysis_run_id does not match run directory")
     expected_day = datetime.fromtimestamp(cutoff / 1000, UTC).date().isoformat()
@@ -257,6 +317,13 @@ def _eligible_cases(run: Path, manifest: dict, manifest_hash: str, payloads, has
     config = _decode(payloads["config-snapshot.json"], "config snapshot")
     if config.get("_config_hash") != manifest["config_hash"]:
         raise EvidenceError("config hash mismatch")
+    governed_config = dict(config)
+    governed_config.pop("_config_hash", None)
+    if (
+        manifest["schema_version"] == "2"
+        and config_hash(governed_config) != manifest["config_hash"]
+    ):
+        raise EvidenceError("config snapshot content hash mismatch")
     decision = _decode(payloads["decision.json"], "decision")
     if set(decision) != {"status", "symbols"} or decision["status"] not in _STATUSES:
         raise EvidenceError("invalid run decision")
@@ -293,14 +360,17 @@ def _eligible_cases(run: Path, manifest: dict, manifest_hash: str, payloads, has
         indicators = body.get("indicators")
         if not isinstance(indicators, dict) or not indicators:
             raise EvidenceError("invalid indicators")
-        _validate_indicators(indicators, manifest["config_hash"])
-        if symbol_decision != _expected_gate_decision(indicators):
+        timestamp_limit = analysis_boundary if analysis_boundary is not None else cutoff
+        _validate_indicators(indicators, manifest["config_hash"], gates, timestamp_limit)
+        if symbol_decision != _expected_gate_decision(indicators, gates):
             raise EvidenceError("gate decision does not match authoritative state machine")
         identity = _canonical([manifest["analysis_run_id"], symbol])
         cases.append(
             {
                 "case_id": hashlib.sha256(identity).hexdigest(),
                 "analysis_run_id": manifest["analysis_run_id"],
+                "strategy_version": strategy_version,
+                "analysis_boundary": analysis_boundary,
                 "symbol": symbol,
                 "cutoff": cutoff,
                 "run_status": decision["status"],
@@ -321,6 +391,28 @@ def _eligible_cases(run: Path, manifest: dict, manifest_hash: str, payloads, has
     if decision["status"] != expected_run_status:
         raise EvidenceError("run status disagrees with symbol decisions")
     return cases
+
+
+def _validate_v2_claim(runs_root: Path, run: Path, manifest: dict, manifest_hash: str) -> None:
+    database = runs_root.parent / "data" / "market.sqlite3"
+    if not database.is_file():
+        raise EvidenceError("schema-v2 published claim database missing")
+    try:
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+            row = connection.execute(
+                """SELECT status,artifact_day,manifest_sha256
+                FROM analysis_claims
+                WHERE strategy_version=? AND analysis_boundary=? AND analysis_run_id=?""",
+                (
+                    manifest["strategy_version"],
+                    manifest["analysis_boundary"],
+                    manifest["analysis_run_id"],
+                ),
+            ).fetchone()
+    except sqlite3.Error as error:
+        raise EvidenceError("schema-v2 published claim unavailable") from error
+    if row != ("PUBLISHED", run.parent.name, manifest_hash):
+        raise EvidenceError("schema-v2 published claim mismatch")
 
 
 def build_casebook(runs_root: Path, milestone_target: int = 20) -> dict:
@@ -345,33 +437,71 @@ def build_casebook(runs_root: Path, milestone_target: int = 20) -> dict:
                     {"path": str(run.relative_to(runs_root)), "reason": "LEGACY_SCHEMA"}
                 )
                 continue
-            if manifest["schema_version"] != "1":
-                raise EvidenceError("unsupported schema_version")
+            _strategy_contract(manifest)
+            if manifest.get("schema_version") == "2":
+                _validate_v2_claim(runs_root, run, manifest, manifest_hash)
             cases.extend(_eligible_cases(run, manifest, manifest_hash, payloads, hashes))
             eligible_runs += 1
     cases.sort(key=lambda row: (row["cutoff"], row["analysis_run_id"], row["symbol"]))
-    status_counts = Counter(row["status"] for row in cases)
-    failed_gate_counts = Counter(
-        row["failed_gate"] for row in cases if row["failed_gate"] is not None
+    strategy_versions = {}
+    for strategy_version in sorted({row["strategy_version"] for row in cases}):
+        version_cases = [row for row in cases if row["strategy_version"] == strategy_version]
+        version_statuses = Counter(row["status"] for row in version_cases)
+        version_gates = Counter(
+            row["failed_gate"] for row in version_cases if row["failed_gate"] is not None
+        )
+        version_reasons = Counter(reason for row in version_cases for reason in row["reason_codes"])
+        boundaries = {
+            row["analysis_boundary"]
+            for row in version_cases
+            if row["analysis_boundary"] is not None
+        }
+        strategy_versions[strategy_version] = {
+            "eligible_cases": len(version_cases),
+            "unique_dataset_cutoffs": len(
+                {(row["dataset_version"], row["cutoff"]) for row in version_cases}
+            ),
+            "unique_analysis_boundaries": len(boundaries),
+            "status_counts": dict(sorted(version_statuses.items())),
+            "failed_gate_counts": dict(sorted(version_gates.items())),
+            "reason_counts": dict(sorted(version_reasons.items())),
+            "milestone_remaining": max(0, milestone_target - len(version_cases)),
+            "milestone_reached": len(version_cases) >= milestone_target,
+        }
+    active_strategy = V2_STRATEGY_VERSION
+    active = strategy_versions.get(
+        active_strategy,
+        {
+            "eligible_cases": 0,
+            "unique_dataset_cutoffs": 0,
+            "unique_analysis_boundaries": 0,
+            "status_counts": {},
+            "failed_gate_counts": {},
+            "reason_counts": {},
+            "milestone_remaining": milestone_target,
+            "milestone_reached": False,
+        },
     )
-    reason_counts = Counter(reason for row in cases for reason in row["reason_codes"])
-    unique_dataset_cutoffs = len({(row["dataset_version"], row["cutoff"]) for row in cases})
     return {
-        "schema_version": "1",
+        "schema_version": "2",
         "cases": cases,
         "exclusions": sorted(exclusions, key=lambda row: row["path"]),
         "summary": {
             "discovered_runs": discovered_runs,
             "eligible_runs": eligible_runs,
             "ineligible_runs": discovered_runs - eligible_runs,
-            "eligible_cases": len(cases),
-            "unique_dataset_cutoffs": unique_dataset_cutoffs,
-            "status_counts": dict(sorted(status_counts.items())),
-            "failed_gate_counts": dict(sorted(failed_gate_counts.items())),
-            "reason_counts": dict(sorted(reason_counts.items())),
+            "total_eligible_cases": len(cases),
+            "active_strategy_version": active_strategy,
+            "eligible_cases": active["eligible_cases"],
+            "unique_dataset_cutoffs": active["unique_dataset_cutoffs"],
+            "unique_analysis_boundaries": active["unique_analysis_boundaries"],
+            "strategy_versions": strategy_versions,
+            "status_counts": active["status_counts"],
+            "failed_gate_counts": active["failed_gate_counts"],
+            "reason_counts": active["reason_counts"],
             "milestone_target": milestone_target,
-            "milestone_remaining": max(0, milestone_target - len(cases)),
-            "milestone_reached": len(cases) >= milestone_target,
+            "milestone_remaining": active["milestone_remaining"],
+            "milestone_reached": active["milestone_reached"],
         },
     }
 

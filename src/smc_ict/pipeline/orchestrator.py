@@ -5,13 +5,58 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..casebook import build_casebook
 from ..config import AppConfig, config_dict, config_hash
 from ..storage import MarketRepository
-from .analysis import analyze_symbol
+from .v2_analysis import analyze_symbol_v2
+from .v2_state_machine import V2_STRATEGY_VERSION
+
+
+def _open_directory(name, *, dir_fd=None):
+    return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+
+
+def _mkdir_open(name, *, dir_fd):
+    with suppress(FileExistsError):
+        os.mkdir(name, dir_fd=dir_fd)
+    return _open_directory(name, dir_fd=dir_fd)
+
+
+def _write_json_at(directory_fd: int, name: str, value: dict) -> bytes:
+    payload = (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
+    fd = os.open(
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        with os.fdopen(fd, "wb", closefd=False) as stream:
+            stream.write(payload)
+            stream.flush()
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return payload
+
+
+def _read_at(directory_fd: int, name: str) -> bytes:
+    fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"published artifact is not a regular file: {name}")
+        chunks = []
+        while chunk := os.read(fd, 1 << 20):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 def _source_version() -> str:
@@ -42,10 +87,13 @@ class RunResult:
     analysis_run_id: str | None = None
     run_dir: Path | None = None
     error: str | None = None
+    strategy_version: str | None = None
+    analysis_boundary: int | None = None
+    manifest_sha256: str | None = None
 
 
 class Orchestrator:
-    def __init__(self, config: AppConfig, client, analyzer=analyze_symbol):
+    def __init__(self, config: AppConfig, client, analyzer=analyze_symbol_v2):
         self.config = config
         self.client = client
         self.analyzer = analyzer
@@ -94,15 +142,43 @@ class Orchestrator:
     def analyze_latest(self):
         latest: tuple[str, int] | None = None
         ingestion_run_id: str | None = None
+        analysis_boundary: int | None = None
         try:
             repo = MarketRepository(self.config.data_root / "data" / "market.sqlite3")
             latest = repo.latest_committed()
             if latest is None:
                 raise ValueError("no committed dataset")
             version, cutoff = latest
+            analysis_boundary = ((cutoff + 1) // 3_600_000) * 3_600_000 - 1
+            if analysis_boundary < 0:
+                raise ValueError("no complete closed 1H boundary")
             ingestion_run_id = repo.committed_ingestion_for_dataset(version)
             if ingestion_run_id is None:
                 raise ValueError("no committed ingestion for latest dataset cutoff")
+            run_id = "run-" + uuid.uuid4().hex
+            claimed, existing_claim = repo.claim_analysis_boundary(
+                V2_STRATEGY_VERSION,
+                analysis_boundary,
+                version,
+                ingestion_run_id,
+                run_id,
+            )
+            if not claimed:
+                if existing_claim is None or existing_claim[3] != "PUBLISHED":
+                    raise ValueError("analysis boundary already claimed but not published")
+                existing = self._existing_boundary_run(analysis_boundary)
+                if existing is None or existing[1]["analysis_run_id"] != existing_claim[2]:
+                    raise ValueError("published analysis claim artifact mismatch")
+                run_dir, row = existing
+                return RunResult(
+                    "SKIPPED_ALREADY_ANALYZED",
+                    version,
+                    ingestion_run_id,
+                    row["analysis_run_id"],
+                    run_dir,
+                    strategy_version=V2_STRATEGY_VERSION,
+                    analysis_boundary=analysis_boundary,
+                )
             snap = repo.snapshot(version)
             results = {s: self.analyzer(snap, s, self.config.strategy) for s in self.config.symbols}
             config_digest = config_hash(self.config)
@@ -111,24 +187,72 @@ class Orchestrator:
                 for indicator in result["indicators"].values():
                     indicator["input_hash"] = input_digest
                     indicator["config_hash"] = config_digest
-            return self._publish(
+            published = self._publish(
                 ingestion_run_id,
                 version,
                 cutoff,
+                analysis_boundary,
                 results,
                 repo.dataset_checksum(version),
                 config_digest,
+                run_id,
             )
+            if published.run_dir is None or published.manifest_sha256 is None:
+                raise ValueError("published artifact commitment missing")
+            repo.publish_analysis_claim(
+                V2_STRATEGY_VERSION,
+                analysis_boundary,
+                run_id,
+                published.run_dir,
+                published.manifest_sha256,
+            )
+            return published
         except Exception as e:
             return RunResult(
                 "FAILED",
                 dataset_version=latest[0] if latest else None,
                 ingestion_run_id=ingestion_run_id,
                 error=f"{type(e).__name__}: {e}",
+                strategy_version=V2_STRATEGY_VERSION,
+                analysis_boundary=analysis_boundary,
             )
 
-    def _publish(self, ingestion_run_id, version, cutoff, results, dataset_checksum, config_digest):
-        run_id = "run-" + uuid.uuid4().hex
+    def _existing_boundary_run(self, analysis_boundary: int) -> tuple[Path, dict] | None:
+        runs_root = self.config.data_root / "runs"
+        if not runs_root.exists():
+            return None
+        casebook = build_casebook(runs_root)
+        rows = [
+            row
+            for row in casebook["cases"]
+            if row["strategy_version"] == V2_STRATEGY_VERSION
+            and row["analysis_boundary"] == analysis_boundary
+        ]
+        run_ids = {row["analysis_run_id"] for row in rows}
+        if len(run_ids) > 1:
+            raise ValueError("duplicate v2 analysis boundary")
+        if not rows:
+            return None
+        row = rows[0]
+        day = (
+            __import__("datetime")
+            .datetime.fromtimestamp(row["cutoff"] / 1000, __import__("datetime").timezone.utc)
+            .date()
+            .isoformat()
+        )
+        return runs_root / day / row["analysis_run_id"], row
+
+    def _publish(
+        self,
+        ingestion_run_id,
+        version,
+        cutoff,
+        analysis_boundary,
+        results,
+        dataset_checksum,
+        config_digest,
+        run_id,
+    ):
         day = (
             "1970-01-01"
             if cutoff < 86_400_000
@@ -137,19 +261,16 @@ class Orchestrator:
             .date()
             .isoformat()
         )
-        base = self.config.data_root / "runs" / day
-        tmp = self.config.data_root / "runs" / ".tmp" / run_id
-        final = base / run_id
-        tmp.mkdir(parents=True)
-        (tmp / "indicators").mkdir()
+        runs_root = self.config.data_root / "runs"
+        final = runs_root / day / run_id
         run_status = aggregate_status(results)
         decision = {"status": run_status, "symbols": results}
         cfg = config_dict(self.config)
         cfg["_config_hash"] = config_digest
-        (tmp / "config-snapshot.json").write_text(json.dumps(cfg, sort_keys=True, indent=2) + "\n")
-        (tmp / "decision.json").write_text(json.dumps(decision, sort_keys=True, indent=2) + "\n")
         manifest = {
-            "schema_version": "1",
+            "schema_version": "2",
+            "strategy_version": V2_STRATEGY_VERSION,
+            "analysis_boundary": analysis_boundary,
             "ingestion_run_id": ingestion_run_id,
             "analysis_run_id": run_id,
             "dataset_version": version,
@@ -159,9 +280,70 @@ class Orchestrator:
             "code_version": _source_version(),
             "files": {},
         }
-        for name in ("config-snapshot.json", "decision.json"):
-            manifest["files"][name] = hashlib.sha256((tmp / name).read_bytes()).hexdigest()
-        (tmp / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
-        base.mkdir(parents=True, exist_ok=True)
-        os.rename(tmp, final)
-        return RunResult(run_status, version, ingestion_run_id, run_id, final)
+        data_root_fd = _open_directory(self.config.data_root)
+        manifest_payload = b""
+        try:
+            runs_fd = _mkdir_open("runs", dir_fd=data_root_fd)
+            try:
+                tmp_fd = _mkdir_open(".tmp", dir_fd=runs_fd)
+                day_fd = _mkdir_open(day, dir_fd=runs_fd)
+                try:
+                    os.mkdir(run_id, dir_fd=tmp_fd)
+                    run_fd = _open_directory(run_id, dir_fd=tmp_fd)
+                    try:
+                        payloads = {
+                            "config-snapshot.json": _write_json_at(
+                                run_fd, "config-snapshot.json", cfg
+                            ),
+                            "decision.json": _write_json_at(run_fd, "decision.json", decision),
+                        }
+                        manifest["files"] = {
+                            name: hashlib.sha256(payload).hexdigest()
+                            for name, payload in payloads.items()
+                        }
+                        manifest_payload = _write_json_at(run_fd, "manifest.json", manifest)
+                        staged_identity = os.fstat(run_fd)
+                        os.fsync(run_fd)
+                        os.rename(run_id, run_id, src_dir_fd=tmp_fd, dst_dir_fd=day_fd)
+                        os.fsync(tmp_fd)
+                        os.fsync(day_fd)
+                        public_fd = _open_directory(run_id, dir_fd=day_fd)
+                        try:
+                            public_identity = os.fstat(public_fd)
+                            if (public_identity.st_dev, public_identity.st_ino) != (
+                                staged_identity.st_dev,
+                                staged_identity.st_ino,
+                            ):
+                                raise ValueError("published run inode mismatch")
+                            if set(os.listdir(public_fd)) != {
+                                "config-snapshot.json",
+                                "decision.json",
+                                "manifest.json",
+                            }:
+                                raise ValueError("published run artifact set mismatch")
+                            expected_payloads = payloads | {"manifest.json": manifest_payload}
+                            for name, expected_payload in expected_payloads.items():
+                                if _read_at(public_fd, name) != expected_payload:
+                                    raise ValueError("published run content mismatch")
+                        finally:
+                            os.close(public_fd)
+                    finally:
+                        os.close(run_fd)
+                finally:
+                    os.close(day_fd)
+                    os.close(tmp_fd)
+                os.fsync(runs_fd)
+            finally:
+                os.close(runs_fd)
+        finally:
+            os.close(data_root_fd)
+        return RunResult(
+            run_status,
+            version,
+            ingestion_run_id,
+            run_id,
+            final,
+            strategy_version=V2_STRATEGY_VERSION,
+            analysis_boundary=analysis_boundary,
+            manifest_sha256=hashlib.sha256(manifest_payload).hexdigest(),
+        )

@@ -16,7 +16,7 @@ def test_toml_config_and_fixture_cli(tmp_path: Path, capsys):
     assert load_config(config).bootstrap_bars == 300
     assert main(["run-once", "--config", str(config), "--fixture"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["status"] in {"NO_SETUP", "ARMED", "ORDER_PENDING", "TRADE"}
+    assert payload["status"] in {"BLOCKED", "NO_SETUP", "ARMED", "ORDER_PENDING", "TRADE"}
     assert payload["dataset_version"].startswith("ds-")
     assert (tmp_path / "var-fixture" / "data" / "market.sqlite3").exists()
     assert not (tmp_path / "var" / "data" / "market.sqlite3").exists()

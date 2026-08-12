@@ -54,7 +54,7 @@ def test_scheduled_analysis_retries_lock_collision_then_builds_casebook(tmp_path
         [
             '{"status":"SKIPPED_LOCKED"}',
             '{"status":"SKIPPED_LOCKED"}',
-            '{"status":"NO_SETUP","dataset_version":"ds-x"}',
+            '{"status":"NO_SETUP","dataset_version":"ds-x","strategy_version":"v2-1d-4h-1h","analysis_boundary":7199999}',
             '{"eligible_cases":20,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}',
         ],
     )
@@ -69,12 +69,35 @@ def test_scheduled_analysis_reports_persistent_lock_collision(tmp_path: Path):
     assert "remained locked" in result.stderr
 
 
+def test_scheduled_analysis_rejects_failed_or_unknown_success_receipt(tmp_path: Path):
+    for index, receipt in enumerate(('{"status":"FAILED","error":"boom"}', '{"status":"UNKNOWN"}')):
+        result, counter = _run_analysis_script(tmp_path / f"bad-analysis-status-{index}", [receipt])
+        assert result.returncode != 0
+        assert "invalid analysis status" in result.stderr
+        assert counter.read_text() == "1"
+
+
+def test_scheduled_analysis_rejects_missing_or_wrong_v2_identity(tmp_path: Path):
+    invalid = (
+        '{"status":"NO_SETUP","dataset_version":"ds-x","analysis_boundary":7199999}',
+        '{"status":"NO_SETUP","dataset_version":"ds-x","strategy_version":"v1-4h-1h-5m","analysis_boundary":7199999}',
+        '{"status":"NO_SETUP","dataset_version":"ds-x","strategy_version":"v2-1d-4h-1h","analysis_boundary":7200000}',
+    )
+    for index, receipt in enumerate(invalid):
+        result, counter = _run_analysis_script(
+            tmp_path / f"bad-analysis-identity-{index}", [receipt]
+        )
+        assert result.returncode != 0
+        assert "invalid v2 identity" in result.stderr
+        assert counter.read_text() == "1"
+
+
 def test_scheduled_ingest_retries_lock_collision(tmp_path: Path):
     bin_dir, counter = _fake_uv(
         tmp_path,
         [
             '{"status":"SKIPPED_LOCKED"}',
-            '{"status":"COMMITTED","dataset_version":"ds-x"}',
+            '{"status":"COMMITTED","dataset_version":"ds-x","ingestion_run_id":"ingest-x"}',
         ],
     )
     env = os.environ | {
@@ -118,6 +141,54 @@ def test_scheduled_ingest_reports_persistent_lock_collision(tmp_path: Path):
     assert result.returncode != 0
     assert counter.read_text() == "3"
     assert "remained locked" in result.stderr
+
+
+def test_scheduled_ingest_rejects_failed_or_unknown_success_receipt(tmp_path: Path):
+    for index, receipt in enumerate(('{"status":"FAILED","error":"boom"}', '{"status":"UNKNOWN"}')):
+        case = tmp_path / f"bad-ingest-status-{index}"
+        bin_dir, counter = _fake_uv(case, [receipt])
+        env = os.environ | {
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "FAKE_UV_COUNTER": str(counter),
+            "FAKE_UV_RESPONSES": str(case / "responses"),
+            "SMC_ICT_RETRY_DELAY": "0",
+            "SMC_ICT_MAX_LOCK_ATTEMPTS": "3",
+            "SMC_ICT_LOG_DIR": str(case / "logs"),
+        }
+        result = subprocess.run(
+            ["bash", "scripts/scheduled-ingest.sh"],
+            cwd=Path(__file__).parents[1],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode != 0
+        assert "invalid ingestion status" in result.stderr
+        assert counter.read_text() == "1"
+        assert not (case / "logs" / "ingestion.jsonl").exists()
+
+
+def test_scheduled_ingest_rejects_committed_receipt_without_identity(tmp_path: Path):
+    case = tmp_path / "missing-ingest-identity"
+    bin_dir, counter = _fake_uv(case, ['{"status":"COMMITTED"}'])
+    env = os.environ | {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "FAKE_UV_COUNTER": str(counter),
+        "FAKE_UV_RESPONSES": str(case / "responses"),
+        "SMC_ICT_LOG_DIR": str(case / "logs"),
+    }
+    result = subprocess.run(
+        ["bash", "scripts/scheduled-ingest.sh"],
+        cwd=Path(__file__).parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "invalid ingestion identity" in result.stderr
+    assert not (case / "logs" / "ingestion.jsonl").exists()
 
 
 def test_scheduled_wrappers_reject_invalid_retry_configuration(tmp_path: Path):
@@ -179,7 +250,7 @@ def test_scheduled_wrappers_reject_mixed_or_invalid_receipts(tmp_path: Path):
 
 
 def test_scheduled_analysis_rejects_invalid_casebook_receipt(tmp_path: Path):
-    valid_analysis = '{"status":"NO_SETUP","dataset_version":"ds-x"}'
+    valid_analysis = '{"status":"NO_SETUP","dataset_version":"ds-x","strategy_version":"v2-1d-4h-1h","analysis_boundary":7199999}'
     invalid_receipts = (
         'warning-before-{"eligible_cases":20,"sha256":"' + "a" * 64 + '"}',
         '{"eligible_cases":20,"sha256":"' + "a" * 64 + '"}\\n{}',

@@ -19,7 +19,7 @@ for ((attempt = 1; attempt <= max_attempts; attempt++)); do
     printf '%s\n' "$analysis" >&2
     exit 1
   fi
-  if ! status="$(python3 -c 'import json,sys; value=json.loads(sys.argv[1]); assert isinstance(value,dict) and isinstance(value.get("status"),str); print(value["status"])' "$analysis" 2>/dev/null)"; then
+  if ! status="$(python3 -c 'import json,sys; v=json.loads(sys.argv[1]); assert isinstance(v,dict) and isinstance(v.get("status"),str); print(v["status"])' "$analysis" 2>/dev/null)"; then
     printf 'invalid JSON receipt from SMC/ICT analysis\n' >&2
     exit 1
   fi
@@ -32,6 +32,20 @@ for ((attempt = 1; attempt <= max_attempts; attempt++)); do
   fi
   sleep "$retry_delay"
 done
+
+case "$status" in
+  NO_SETUP|BLOCKED|TRADE|ORDER_PENDING|ARMED|SKIPPED_ALREADY_ANALYZED) ;;
+  *)
+    printf 'invalid analysis status: %s\n' "$status" >&2
+    exit 1
+    ;;
+esac
+
+if ! receipt_identity="$(python3 -c 'import json,sys; v=json.loads(sys.argv[1]); assert v.get("strategy_version")=="v2-1d-4h-1h"; b=v.get("analysis_boundary"); assert isinstance(b,int) and not isinstance(b,bool) and b>=3599999 and (b+1)%3600000==0; d=v.get("dataset_version"); assert isinstance(d,str) and d; print(b,d)' "$analysis" 2>/dev/null)"; then
+  printf 'invalid v2 identity in SMC/ICT analysis receipt\n' >&2
+  exit 1
+fi
+read -r analysis_boundary dataset_version <<< "$receipt_identity"
 
 if ! casebook="$(uv run smc-ict casebook --runs-root var/runs --output "$evidence_dir/casebook.json" --milestone-target 20 2>&1)"; then
   printf '%s\n' "$casebook" >&2

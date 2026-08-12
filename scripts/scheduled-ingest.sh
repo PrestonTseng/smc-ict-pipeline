@@ -31,4 +31,12 @@ for ((attempt = 1; attempt <= max_attempts; attempt++)); do
   fi
   sleep "$retry_delay"
 done
+if [[ "$status" != "COMMITTED" ]]; then
+  printf 'invalid ingestion status: %s\n' "$status" >&2
+  exit 1
+fi
+if ! python3 -c 'import json,sys; v=json.loads(sys.argv[1]); assert isinstance(v.get("dataset_version"),str) and v["dataset_version"]; assert isinstance(v.get("ingestion_run_id"),str) and v["ingestion_run_id"]' "$result" 2>/dev/null; then
+  printf 'invalid ingestion identity in SMC/ICT receipt\n' >&2
+  exit 1
+fi
 printf '%s %s\n' "$(date -u +%FT%TZ)" "$result" >> "$log_dir/ingestion.jsonl"

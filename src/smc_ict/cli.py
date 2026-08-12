@@ -79,6 +79,8 @@ def main(argv=None):
                 "analysis_run_id": r.analysis_run_id,
                 "run_dir": str(r.run_dir) if r.run_dir else None,
                 "error": r.error,
+                "strategy_version": r.strategy_version,
+                "analysis_boundary": r.analysis_boundary,
             },
             sort_keys=True,
         )

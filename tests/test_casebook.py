@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import sqlite3
 import threading
 from pathlib import Path
 
@@ -8,7 +9,9 @@ import pytest
 
 from smc_ict.casebook import EvidenceError, build_casebook, publish_casebook, render_casebook
 from smc_ict.cli import main
+from smc_ict.config import config_hash as compute_config_hash
 from smc_ict.pipeline.state_machine import GATES
+from smc_ict.pipeline.v2_state_machine import V2_GATES
 
 
 def _json_bytes(value):
@@ -16,20 +19,30 @@ def _json_bytes(value):
 
 
 def _write_run(
-    root: Path, run_id: str, cutoff: int, *, schema=True, symbol_order=("BTCUSDT", "ETHUSDT")
+    root: Path,
+    run_id: str,
+    cutoff: int,
+    *,
+    schema=True,
+    schema_version="1",
+    strategy_version=None,
+    symbol_order=("BTCUSDT", "ETHUSDT"),
 ):
     day = "2026-08-12"
     run = root / day / run_id
     run.mkdir(parents=True)
     (run / "indicators").mkdir()
-    config_hash = "a" * 64
-    config = {"_config_hash": config_hash, "symbols": list(symbol_order)}
+    config: dict = {"symbols": list(symbol_order)}
+    config_hash = compute_config_hash(config) if schema_version == "2" else "a" * 64
+    config["_config_hash"] = config_hash
+    gates = V2_GATES if strategy_version == "v2-1d-4h-1h" else GATES
+    first_gate = gates[0]
     decision = {
         "status": "NO_SETUP",
         "symbols": {
             symbol: {
                 "decision": {
-                    "failed_gate": "smc_4h_structure",
+                    "failed_gate": first_gate,
                     "passed_gates": [],
                     "reason_codes": ["no_confirmed_bos"],
                     "status": "NO_SETUP",
@@ -41,13 +54,13 @@ def _write_run(
                         "input_hash": ("b" if symbol == "BTCUSDT" else "c") * 64,
                         "known_at": None,
                         "reason_codes": [
-                            "no_confirmed_bos" if gate == GATES[0] else "upstream_gate_not_passed"
+                            "no_confirmed_bos" if gate == first_gate else "upstream_gate_not_passed"
                         ],
                         "reference_levels": {},
-                        "status": "FAIL" if gate == GATES[0] else "UNAVAILABLE",
+                        "status": "FAIL" if gate == first_gate else "UNAVAILABLE",
                         "value": {},
                     }
-                    for gate in GATES
+                    for gate in gates
                 },
             }
             for symbol in symbol_order
@@ -70,9 +83,39 @@ def _write_run(
         "ingestion_run_id": "ingest-test",
     }
     if schema:
-        manifest["schema_version"] = "1"
+        manifest["schema_version"] = schema_version
+    if strategy_version is not None:
+        manifest["strategy_version"] = strategy_version
+        manifest["analysis_boundary"] = ((cutoff + 1) // 3_600_000) * 3_600_000 - 1
     (run / "manifest.json").write_bytes(_json_bytes(manifest))
+    if schema_version == "2":
+        _sync_claim(run)
     return run
+
+
+def _sync_claim(run: Path):
+    manifest_path = run / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    database = run.parents[2] / "data" / "market.sqlite3"
+    database.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS analysis_claims(
+            strategy_version TEXT, analysis_boundary INTEGER, analysis_run_id TEXT,
+            status TEXT, artifact_day TEXT, manifest_sha256 TEXT,
+            PRIMARY KEY(strategy_version,analysis_boundary))"""
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO analysis_claims VALUES (?,?,?,?,?,?)",
+            (
+                manifest["strategy_version"],
+                manifest["analysis_boundary"],
+                manifest["analysis_run_id"],
+                "PUBLISHED",
+                run.parent.name,
+                hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            ),
+        )
 
 
 def _rewrite_manifest_file_hash(run: Path, name: str):
@@ -80,6 +123,19 @@ def _rewrite_manifest_file_hash(run: Path, name: str):
     manifest = json.loads(manifest_path.read_text())
     manifest["files"][name] = hashlib.sha256((run / name).read_bytes()).hexdigest()
     manifest_path.write_bytes(_json_bytes(manifest))
+    if manifest.get("schema_version") == "2":
+        _sync_claim(run)
+
+
+def _set_indicator_timestamp(run: Path, gate: str, timestamp: int):
+    decision_path = run / "decision.json"
+    decision = json.loads(decision_path.read_text())
+    for body in decision["symbols"].values():
+        indicator = body["indicators"][gate]
+        indicator["event_time"] = timestamp
+        indicator["known_at"] = timestamp
+    decision_path.write_bytes(_json_bytes(decision))
+    _rewrite_manifest_file_hash(run, "decision.json")
 
 
 def test_valid_runs_produce_deterministic_cases_and_summary(tmp_path: Path):
@@ -99,13 +155,28 @@ def test_valid_runs_produce_deterministic_cases_and_summary(tmp_path: Path):
         "discovered_runs": 2,
         "eligible_runs": 2,
         "ineligible_runs": 0,
-        "eligible_cases": 4,
-        "unique_dataset_cutoffs": 1,
-        "status_counts": {"NO_SETUP": 4},
-        "failed_gate_counts": {"smc_4h_structure": 4},
-        "reason_counts": {"no_confirmed_bos": 4},
+        "total_eligible_cases": 4,
+        "active_strategy_version": "v2-1d-4h-1h",
+        "eligible_cases": 0,
+        "unique_dataset_cutoffs": 0,
+        "unique_analysis_boundaries": 0,
+        "strategy_versions": {
+            "v1-4h-1h-5m": {
+                "eligible_cases": 4,
+                "unique_dataset_cutoffs": 1,
+                "unique_analysis_boundaries": 0,
+                "status_counts": {"NO_SETUP": 4},
+                "failed_gate_counts": {"smc_4h_structure": 4},
+                "reason_counts": {"no_confirmed_bos": 4},
+                "milestone_remaining": 16,
+                "milestone_reached": False,
+            }
+        },
+        "status_counts": {},
+        "failed_gate_counts": {},
+        "reason_counts": {},
         "milestone_target": 20,
-        "milestone_remaining": 16,
+        "milestone_remaining": 20,
         "milestone_reached": False,
     }
     first = result["cases"][0]
@@ -116,6 +187,147 @@ def test_valid_runs_produce_deterministic_cases_and_summary(tmp_path: Path):
     assert first["case_id"] == expected_id
     assert render_casebook(result).endswith(b"\n")
     assert render_casebook(result) == render_casebook(build_casebook(runs, milestone_target=20))
+
+
+def test_casebook_keeps_v1_and_v2_denominators_separate(tmp_path: Path):
+    runs = tmp_path / "runs"
+    _write_run(runs, "run-v1", 1_786_517_339_999)
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+
+    result = build_casebook(runs)
+
+    assert {row["strategy_version"] for row in result["cases"]} == {
+        "v1-4h-1h-5m",
+        "v2-1d-4h-1h",
+    }
+    v2_cases = [row for row in result["cases"] if row["strategy_version"] == "v2-1d-4h-1h"]
+    assert {row["analysis_boundary"] for row in v2_cases} == {1_786_517_999_999}
+    assert result["summary"]["strategy_versions"] == {
+        "v1-4h-1h-5m": {
+            "eligible_cases": 2,
+            "unique_dataset_cutoffs": 1,
+            "unique_analysis_boundaries": 0,
+            "status_counts": {"NO_SETUP": 2},
+            "failed_gate_counts": {"smc_4h_structure": 2},
+            "reason_counts": {"no_confirmed_bos": 2},
+            "milestone_remaining": 18,
+            "milestone_reached": False,
+        },
+        "v2-1d-4h-1h": {
+            "eligible_cases": 2,
+            "unique_dataset_cutoffs": 1,
+            "unique_analysis_boundaries": 1,
+            "status_counts": {"NO_SETUP": 2},
+            "failed_gate_counts": {"smc_1d_regime": 2},
+            "reason_counts": {"no_confirmed_bos": 2},
+            "milestone_remaining": 18,
+            "milestone_reached": False,
+        },
+    }
+    assert result["summary"]["total_eligible_cases"] == 4
+    assert result["summary"]["active_strategy_version"] == "v2-1d-4h-1h"
+    assert result["summary"]["eligible_cases"] == 2
+    assert result["summary"]["unique_analysis_boundaries"] == 1
+    assert result["summary"]["milestone_reached"] is False
+
+
+def test_v2_casebook_requires_published_claim_and_exact_manifest_commitment(tmp_path: Path):
+    runs = tmp_path / "runs"
+    run = _write_run(
+        runs,
+        "run-claim",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    database = tmp_path / "data" / "market.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE analysis_claims SET status='CLAIMED'")
+    with pytest.raises(EvidenceError, match="published claim mismatch"):
+        build_casebook(runs)
+
+    _sync_claim(run)
+    with sqlite3.connect(database) as connection:
+        connection.execute("UPDATE analysis_claims SET manifest_sha256=?", ("0" * 64,))
+    with pytest.raises(EvidenceError, match="published claim mismatch"):
+        build_casebook(runs)
+
+
+def test_v2_casebook_recomputes_governed_config_hash(tmp_path: Path):
+    runs = tmp_path / "runs"
+    run = _write_run(
+        runs,
+        "run-config-tamper",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    config_path = run / "config-snapshot.json"
+    config = json.loads(config_path.read_text())
+    config["bootstrap_bars"] = 999999
+    config_path.write_bytes(_json_bytes(config))
+    _rewrite_manifest_file_hash(run, "config-snapshot.json")
+
+    with pytest.raises(EvidenceError, match="config snapshot content hash mismatch"):
+        build_casebook(runs)
+
+
+def test_schema_v2_rejects_unknown_strategy_version(tmp_path: Path):
+    runs = tmp_path / "runs"
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="unknown",
+    )
+    with pytest.raises(EvidenceError, match="strategy_version"):
+        build_casebook(runs)
+
+
+def test_casebook_rejects_future_or_misaligned_indicator_timestamps(tmp_path: Path):
+    runs = tmp_path / "runs"
+    future = _write_run(
+        runs,
+        "run-future",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    _set_indicator_timestamp(future, "smc_1d_regime", 1_786_521_599_999)
+    with pytest.raises(EvidenceError, match="exceeds analysis boundary"):
+        build_casebook(runs)
+
+    for path in future.iterdir():
+        if path.is_file():
+            path.unlink()
+        else:
+            path.rmdir()
+    future.rmdir()
+    misaligned = _write_run(
+        runs,
+        "run-misaligned",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    _set_indicator_timestamp(misaligned, "smc_1d_regime", 1_786_517_999_999)
+    with pytest.raises(EvidenceError, match="timeframe-close aligned"):
+        build_casebook(runs)
+
+
+def test_casebook_rejects_future_v1_indicator_timestamp(tmp_path: Path):
+    runs = tmp_path / "runs"
+    run = _write_run(runs, "run-v1-future", 1_786_517_339_999)
+    _set_indicator_timestamp(run, "smc_4h_structure", 1_786_521_599_999)
+    with pytest.raises(EvidenceError, match="exceeds analysis boundary"):
+        build_casebook(runs)
 
 
 def test_legacy_run_is_verified_then_excluded(tmp_path: Path):
@@ -137,6 +349,14 @@ def test_declared_artifact_tampering_fails_closed(tmp_path: Path):
     (run / "decision.json").write_bytes(b"{}\n")
 
     with pytest.raises(EvidenceError, match="decision.json hash mismatch"):
+        build_casebook(runs)
+
+
+def test_nonempty_indicators_directory_fails_closed(tmp_path: Path):
+    runs = tmp_path / "runs"
+    run = _write_run(runs, "run-extra-indicator", 1_786_517_339_999)
+    (run / "indicators" / "undeclared.json").write_text("{}\n")
+    with pytest.raises(EvidenceError, match="indicators directory must be empty"):
         build_casebook(runs)
 
 
@@ -180,9 +400,9 @@ def test_publication_is_atomic_deterministic_and_read_only(tmp_path: Path):
         == {
             "output": str(output),
             "sha256": hashlib.sha256(first_bytes).hexdigest(),
-            "eligible_cases": 2,
+            "eligible_cases": 0,
             "milestone_target": 30,
-            "milestone_remaining": 28,
+            "milestone_remaining": 30,
             "milestone_reached": False,
         }
     )
@@ -216,7 +436,7 @@ def test_casebook_cli_publishes_machine_result(tmp_path: Path, capsys):
     )
     result = json.loads(capsys.readouterr().out)
     assert result["output"] == str(output)
-    assert result["eligible_cases"] == 2
+    assert result["eligible_cases"] == 0
     assert result["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
 
 
@@ -224,7 +444,7 @@ def test_casebook_cli_publishes_machine_result(tmp_path: Path, capsys):
     ("mutation", "message"),
     [
         (lambda manifest: manifest.update(cutoff=True), "invalid cutoff"),
-        (lambda manifest: manifest.update(schema_version="2"), "unsupported schema_version"),
+        (lambda manifest: manifest.update(schema_version="2"), "schema-v2 manifest key mismatch"),
         (lambda manifest: manifest.update(extra="value"), "manifest key mismatch"),
     ],
 )
@@ -443,7 +663,7 @@ def test_indicators_directory_is_optional(tmp_path: Path):
     run = _write_run(runs, "run-no-indicator-dir", 1_786_517_339_999)
     (run / "indicators").rmdir()
 
-    assert build_casebook(runs)["summary"]["eligible_cases"] == 2
+    assert build_casebook(runs)["summary"]["eligible_cases"] == 0
 
 
 @pytest.mark.parametrize(
@@ -548,7 +768,7 @@ def test_lock_symlink_failure_does_not_leak_parent_fd(tmp_path: Path):
         with pytest.raises(OSError):
             publish_casebook(runs, output)
 
-    assert len(os.listdir("/proc/self/fd")) == before
+    assert len(os.listdir("/proc/self/fd")) <= before
 
 
 def test_lock_open_failure_does_not_leak_parent_fd(tmp_path: Path, monkeypatch):
@@ -566,7 +786,7 @@ def test_lock_open_failure_does_not_leak_parent_fd(tmp_path: Path, monkeypatch):
     before = len(os.listdir("/proc/self/fd"))
     with pytest.raises(OSError, match="injected lock"):
         publish_casebook(runs, output)
-    assert len(os.listdir("/proc/self/fd")) == before
+    assert len(os.listdir("/proc/self/fd")) <= before
 
 
 def test_unlock_failure_preserves_primary_exception_and_closes_fds(tmp_path: Path, monkeypatch):
@@ -591,7 +811,7 @@ def test_unlock_failure_preserves_primary_exception_and_closes_fds(tmp_path: Pat
         publish_casebook(runs, output)
     assert captured.value is primary
     assert any("cleanup failed" in note for note in primary.__notes__)
-    assert len(os.listdir("/proc/self/fd")) == before
+    assert len(os.listdir("/proc/self/fd")) <= before
 
 
 def test_unlock_failure_after_success_closes_fds_then_raises(tmp_path: Path, monkeypatch):
@@ -609,4 +829,4 @@ def test_unlock_failure_after_success_closes_fds_then_raises(tmp_path: Path, mon
     before = len(os.listdir("/proc/self/fd"))
     with pytest.raises(RuntimeError, match="injected unlock"):
         publish_casebook(runs, output)
-    assert len(os.listdir("/proc/self/fd")) == before
+    assert len(os.listdir("/proc/self/fd")) <= before

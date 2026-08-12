@@ -1,6 +1,6 @@
 # SMC/ICT Pipeline
 
-A point-in-time-safe research pipeline that uses **SMC for 4H/1H context** and **ICT for 5m execution gates**. Binance USDⓈ-M closed 1m klines are the only market-data source of truth; 5m, 1H, and 4H bars are derived locally from one committed snapshot.
+A point-in-time-safe research pipeline whose current strategy is **1D regime → 4H context/POI → 1H execution**. Binance USDⓈ-M closed 1m klines are the only market-data source of truth; complete UTC-aligned 1D, 4H, and 1H bars are derived locally from one committed snapshot. Historical schema-v1 evidence remains readable as `v1-4h-1h-5m` but is not extended after the v2 cutover.
 
 > Research software only. It does not place orders, is not financial advice, and makes no profitability claim.
 
@@ -9,9 +9,9 @@ A point-in-time-safe research pipeline that uses **SMC for 4H/1H context** and *
 ```text
 cron → lock → Binance 1m fetch → validate complete BTC/ETH universe
      → SQLite atomic dataset commit → pin dataset version
-     → deterministic 5m/1H/4H aggregation
-     → independent SMC/ICT indicators → strict gate state machine
-     → immutable analysis artifact
+     → deterministic UTC 1D/4H/1H aggregation
+     → strict v2 SMC/ICT gate state machine
+     → schema-v2 immutable artifact + versioned casebook
 ```
 
 TradingView is deliberately outside the numeric data path. It may be used manually to visualize results, never as a second OHLCV truth source.
@@ -52,14 +52,16 @@ deterministic test data can never share the live SQLite database.
 Scheduled forward capture separates cadence from data grain. `ingest-once`
 fetches and atomically commits every missing closed 1m bar. `analyze-once`
 never fetches market data; it pins the latest committed dataset and publishes
-one immutable analysis run. Both commands share the same non-blocking process
-lock, so analysis cannot overlap ingestion.
+at most one immutable analysis run per closed UTC 1H boundary. A repeated
+boundary returns `SKIPPED_ALREADY_ANALYZED` without adding an artifact. Both
+commands share the same non-blocking process lock, so analysis cannot overlap
+ingestion.
 
 ```cron
 # Every minute: canonical closed 1m ingestion.
 * * * * * cd /path/to/smc-ict-pipeline && scripts/scheduled-ingest.sh
-# Every five minutes: analyze the latest pinned snapshot and rebuild casebook.
-2-59/5 * * * * cd /path/to/smc-ict-pipeline && scripts/scheduled-analysis.sh
+# Minute 1 each hour: analyze the latest complete closed-1H boundary and rebuild casebook.
+1 * * * * cd /path/to/smc-ict-pipeline && scripts/scheduled-analysis.sh
 # Daily 10:00 in an Asia/Taipei scheduler: evidence-only human receipt.
 0 10 * * * cd /path/to/smc-ict-pipeline && scripts/daily-summary.py
 ```
@@ -81,13 +83,16 @@ remain visible to the scheduler. `SKIPPED_LOCKED` is a safe no-op.
 
 Each module under `src/smc_ict/indicators/` is independent and returns a standard `IndicatorResult`:
 
-- 4H structure and bias
-- 1H dealing range and first-touch order block
-- 5m liquidity sweep/reclaim
-- displacement
-- close-confirmed MSS
-- first FVG
+- 1D regime and 4H aligned structure
+- 4H dealing range and first-touch order block
+- 1H liquidity sweep/reclaim
+- 1H displacement and close-confirmed MSS
+- first 1H FVG retracement
 - cost-adjusted structural risk
+
+Some pure indicator modules retain their historical v1 filenames; v2 passes
+only the documented 4H or 1H bars into those primitives. Artifact gate names
+and `strategy_version` are the public strategy contract.
 
 Downstream gates remain `UNAVAILABLE` when an upstream gate did not pass; that is distinct from a valid `FAIL` or “no signal.”
 

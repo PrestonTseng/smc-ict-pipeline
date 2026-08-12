@@ -62,8 +62,8 @@
 - Modify: `src/smc_ict/storage.py`
 - Modify: `src/smc_ict/pipeline/orchestrator.py`
 - Modify: `src/smc_ict/cli.py`
-- Create: `scripts/scheduled-analysis-v2.sh`
-- Test: `tests/test_v2_scheduler.py`
+- Modify: `scripts/scheduled-analysis.sh`
+- Test: `tests/test_scheduled_scripts.py`
 - Test: `tests/test_pipeline.py`
 
 **Interfaces:**
@@ -81,7 +81,7 @@
 
 **Interfaces:**
 - Consumes: published reviewed SHA.
-- Produces: unchanged 1m ingestion job, removed v1 5m analysis job, enabled v2 hourly job, version-aware daily receipt.
+- Produces: unchanged 1m ingestion cadence, the existing analysis job updated in place to v2 hourly cadence, and a version-aware daily receipt.
 
 - [ ] Run `uv lock --check`, `uv sync --locked`, Ruff format/check, full pytest, `uv build`, Bash syntax, diff/runtime/secret scans.
 - [ ] Exercise v2 against a copy of the live SQLite dataset; verify pinned lineage, no market fetch, immutable artifact, and no mutation of v1 evidence.

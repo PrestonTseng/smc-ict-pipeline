@@ -37,7 +37,7 @@ The existing configuration bar counts become v2 execution-bar counts and are fro
 ## Scheduler cutover
 
 - Closed-1m ingestion remains every minute.
-- After reviewed publication and successful CI, remove the v1 five-minute analysis job and create a v2 job at minute 1 of every hour.
+- After reviewed publication and successful CI, update the existing v1 analysis job in place to the v2 name and minute 1 of every hour; do not create a duplicate job.
 - v2 derives `analysis_boundary` as the latest complete UTC 1H close at or before the pinned dataset cutoff. It analyzes at most once per new boundary; later minute-level datasets within the same boundary return an auditable skip receipt and create no artifact.
 - Daily summary remains at 10:00 Asia/Taipei and reports versioned denominators.
 

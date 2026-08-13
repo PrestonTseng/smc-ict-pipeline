@@ -1,4 +1,6 @@
+import csv
 import hashlib
+import io
 import json
 import os
 import sqlite3
@@ -7,7 +9,14 @@ from pathlib import Path
 
 import pytest
 
-from smc_ict.casebook import EvidenceError, build_casebook, publish_casebook, render_casebook
+from smc_ict.casebook import (
+    EvidenceError,
+    build_casebook,
+    publish_casebook,
+    render_casebook,
+    render_casebook_csv,
+    render_casebook_markdown,
+)
 from smc_ict.cli import main
 from smc_ict.config import config_hash as compute_config_hash
 from smc_ict.pipeline.state_machine import GATES
@@ -185,8 +194,71 @@ def test_valid_runs_produce_deterministic_cases_and_summary(tmp_path: Path):
     ).encode()
     expected_id = hashlib.sha256(expected_identity).hexdigest()
     assert first["case_id"] == expected_id
+    assert [step["gate"] for step in first["pipeline_steps"]] == list(GATES)
+    assert first["pipeline_steps"][0] == {
+        "gate": GATES[0],
+        "status": "FAIL",
+        "reason_codes": ["no_confirmed_bos"],
+        "value": {},
+        "reference_levels": {},
+        "event_time": None,
+        "known_at": None,
+        "input_hash": "b" * 64,
+        "config_hash": "a" * 64,
+    }
+    assert first["pipeline_steps"][1]["status"] == "UNAVAILABLE"
+    assert first["pipeline_steps"][1]["reason_codes"] == ["upstream_gate_not_passed"]
     assert render_casebook(result).endswith(b"\n")
     assert render_casebook(result) == render_casebook(build_casebook(runs, milestone_target=20))
+
+
+def test_casebook_human_exports_show_every_pipeline_step(tmp_path: Path):
+    runs = tmp_path / "runs"
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+
+    result = build_casebook(runs)
+    markdown = render_casebook_markdown(result).decode()
+    csv_rows = list(csv.DictReader(io.StringIO(render_casebook_csv(result).decode())))
+
+    assert "| Boundary (UTC) | Symbol | Decision | 1D Regime | 4H Structure |" in markdown
+    assert "## Pipeline step details" in markdown
+    assert "`smc_1d_regime` — **FAIL** — no_confirmed_bos" in markdown
+    assert "`smc_4h_structure` — **UNAVAILABLE** — upstream_gate_not_passed" in markdown
+    assert len(csv_rows) == len(V2_GATES) * 2
+    assert [row["gate"] for row in csv_rows[: len(V2_GATES)]] == list(V2_GATES)
+    assert csv_rows[0]["symbol"] == "BTCUSDT"
+    assert csv_rows[0]["status"] == "FAIL"
+    assert csv_rows[0]["reason_codes"] == "no_confirmed_bos"
+    assert csv_rows[0]["value_json"] == "{}"
+
+
+def test_casebook_human_exports_only_render_active_v2_cohort(tmp_path: Path):
+    runs = tmp_path / "runs"
+    _write_run(runs, "run-v1", 1_786_517_339_999)
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+
+    result = build_casebook(runs)
+    markdown = render_casebook_markdown(result).decode()
+    csv_rows = list(csv.DictReader(io.StringIO(render_casebook_csv(result).decode())))
+
+    assert "run-v1" not in markdown
+    assert "1D Regime" in markdown
+    assert all(row["analysis_run_id"] == "run-v2" for row in csv_rows)
+    assert len(csv_rows) == len(V2_GATES) * 2
+    matrix_lines = [line for line in markdown.splitlines() if line.startswith("|")]
+    assert len({line.count("|") for line in matrix_lines}) == 1
 
 
 def test_casebook_keeps_v1_and_v2_denominators_separate(tmp_path: Path):
@@ -440,6 +512,41 @@ def test_casebook_cli_publishes_machine_result(tmp_path: Path, capsys):
     assert result["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
 
 
+def test_casebook_cli_publishes_json_and_immutable_human_snapshot(tmp_path: Path):
+    runs = tmp_path / "runs"
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    output = tmp_path / "casebook.json"
+    snapshot = tmp_path / "snapshots" / "1786521599999"
+
+    assert (
+        main(
+            [
+                "casebook",
+                "--runs-root",
+                str(runs),
+                "--output",
+                str(output),
+                "--snapshot-output",
+                str(snapshot),
+            ]
+        )
+        == 0
+    )
+
+    assert json.loads(output.read_text())["cases"][0]["pipeline_steps"][0]["gate"] == V2_GATES[0]
+    assert "## Hourly pipeline matrix" in (snapshot / "casebook.md").read_text()
+    csv_rows = list(csv.DictReader((snapshot / "casebook.csv").read_text().splitlines()))
+    assert len(csv_rows) == len(V2_GATES) * 2
+    assert json.loads((snapshot / "casebook.json").read_text()) == json.loads(output.read_text())
+    assert not list(snapshot.parent.glob(".*.tmp"))
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -608,6 +715,132 @@ def test_directory_fsync_failure_restores_existing_output(tmp_path: Path, monkey
     assert output.read_bytes() == b"known-good-output"
     assert not list(tmp_path.glob(".casebook.json.*.tmp"))
     assert not (tmp_path / ".casebook.json.rollback").exists()
+
+
+def test_immutable_snapshot_conflict_fails_closed(tmp_path: Path):
+    runs = tmp_path / "runs"
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    output = tmp_path / "casebook.json"
+    snapshot = tmp_path / "snapshots" / "1786521599999"
+    publish_casebook(runs, output, 20, snapshot)
+    (snapshot / "casebook.json").write_bytes(b"conflicting-generation")
+
+    with pytest.raises(EvidenceError, match="immutable casebook snapshot conflict"):
+        publish_casebook(runs, output, 20, snapshot)
+
+    assert (snapshot / "casebook.json").read_bytes() == b"conflicting-generation"
+    assert not list(snapshot.parent.glob(".*.tmp"))
+
+
+def test_existing_snapshot_rejects_symlink_directory(tmp_path: Path):
+    runs = tmp_path / "runs"
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    output = tmp_path / "casebook.json"
+    target = tmp_path / "mutable-snapshot"
+    publish_casebook(runs, output, 20, target)
+    snapshot = tmp_path / "snapshots" / "1786521599999"
+    snapshot.parent.mkdir()
+    snapshot.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(EvidenceError, match="snapshot must be a real directory"):
+        publish_casebook(runs, output, 20, snapshot)
+
+
+def test_existing_snapshot_rejects_symlink_file(tmp_path: Path):
+    runs = tmp_path / "runs"
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    output = tmp_path / "casebook.json"
+    snapshot = tmp_path / "snapshots" / "1786521599999"
+    publish_casebook(runs, output, 20, snapshot)
+    mutable = tmp_path / "mutable.json"
+    mutable.write_bytes((snapshot / "casebook.json").read_bytes())
+    (snapshot / "casebook.json").unlink()
+    (snapshot / "casebook.json").symlink_to(mutable)
+
+    with pytest.raises(EvidenceError, match="snapshot entry must be a regular file"):
+        publish_casebook(runs, output, 20, snapshot)
+
+
+def test_existing_snapshot_rejects_extra_entry(tmp_path: Path):
+    runs = tmp_path / "runs"
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    output = tmp_path / "casebook.json"
+    snapshot = tmp_path / "snapshots" / "1786521599999"
+    publish_casebook(runs, output, 20, snapshot)
+    (snapshot / "extra.txt").write_text("not part of the snapshot")
+
+    with pytest.raises(EvidenceError, match="snapshot entry set mismatch"):
+        publish_casebook(runs, output, 20, snapshot)
+
+
+def test_snapshot_directory_appears_only_after_all_formats_are_complete(
+    tmp_path: Path, monkeypatch
+):
+    runs = tmp_path / "runs"
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    output = tmp_path / "casebook.json"
+    snapshot = tmp_path / "snapshots" / "1786521599999"
+    entered = threading.Event()
+    release = threading.Event()
+    real_rename = __import__("smc_ict.casebook", fromlist=["os"]).os.rename
+
+    def blocked_snapshot_rename(source, destination):
+        entered.set()
+        release.wait(timeout=5)
+        return real_rename(source, destination)
+
+    monkeypatch.setattr("smc_ict.casebook.os.rename", blocked_snapshot_rename)
+    errors = []
+
+    def publish():
+        try:
+            publish_casebook(runs, output, 20, snapshot)
+        except Exception as error:
+            errors.append(error)
+
+    publisher = threading.Thread(target=publish)
+    publisher.start()
+    assert entered.wait(timeout=5)
+    assert not snapshot.exists()
+    release.set()
+    publisher.join(timeout=5)
+
+    assert not errors
+    assert {path.name for path in snapshot.iterdir()} == {
+        "casebook.json",
+        "casebook.md",
+        "casebook.csv",
+    }
 
 
 def test_directory_fsync_failure_removes_new_output(tmp_path: Path, monkeypatch):

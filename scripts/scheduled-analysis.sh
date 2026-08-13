@@ -47,7 +47,11 @@ if ! receipt_identity="$(python3 -c 'import json,sys; v=json.loads(sys.argv[1]);
 fi
 read -r analysis_boundary dataset_version <<< "$receipt_identity"
 
-if ! casebook="$(uv run smc-ict casebook --runs-root var/runs --output "$evidence_dir/casebook.json" --milestone-target 20 2>&1)"; then
+if ! casebook="$(uv run smc-ict casebook \
+  --runs-root var/runs \
+  --output "$evidence_dir/casebook.json" \
+  --snapshot-output "$evidence_dir/snapshots/$analysis_boundary" \
+  --milestone-target 20 2>&1)"; then
   printf '%s\n' "$casebook" >&2
   exit 1
 fi

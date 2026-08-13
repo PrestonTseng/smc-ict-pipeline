@@ -66,10 +66,8 @@ def test_scheduled_analysis_retries_lock_collision_then_builds_casebook(tmp_path
     assert result.returncode == 0
     assert counter.read_text() == "4"
     invocation = (tmp_path / "invocations").read_text().splitlines()[-1]
-    assert "--markdown-output" in invocation
-    assert str(tmp_path / "evidence" / "casebook.md") in invocation
-    assert "--csv-output" in invocation
-    assert str(tmp_path / "evidence" / "casebook.csv") in invocation
+    assert "--snapshot-output" in invocation
+    assert str(tmp_path / "evidence" / "snapshots" / "7199999") in invocation
 
 
 def test_scheduled_analysis_reports_persistent_lock_collision(tmp_path: Path):

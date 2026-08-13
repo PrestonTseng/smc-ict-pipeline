@@ -50,8 +50,7 @@ read -r analysis_boundary dataset_version <<< "$receipt_identity"
 if ! casebook="$(uv run smc-ict casebook \
   --runs-root var/runs \
   --output "$evidence_dir/casebook.json" \
-  --markdown-output "$evidence_dir/casebook.md" \
-  --csv-output "$evidence_dir/casebook.csv" \
+  --snapshot-output "$evidence_dir/snapshots/$analysis_boundary" \
   --milestone-target 20 2>&1)"; then
   printf '%s\n' "$casebook" >&2
   exit 1

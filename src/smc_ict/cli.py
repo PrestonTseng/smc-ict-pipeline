@@ -26,8 +26,7 @@ def main(argv=None):
     casebook = sub.add_parser("casebook")
     casebook.add_argument("--runs-root", type=Path, required=True)
     casebook.add_argument("--output", type=Path, required=True)
-    casebook.add_argument("--markdown-output", type=Path)
-    casebook.add_argument("--csv-output", type=Path)
+    casebook.add_argument("--snapshot-output", type=Path)
     casebook.add_argument("--milestone-target", type=int, default=20)
     args = p.parse_args(argv)
     if args.command == "backup":
@@ -40,8 +39,7 @@ def main(argv=None):
                     args.runs_root,
                     args.output,
                     args.milestone_target,
-                    args.markdown_output,
-                    args.csv_output,
+                    args.snapshot_output,
                 ),
                 sort_keys=True,
             )

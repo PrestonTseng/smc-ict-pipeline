@@ -7,6 +7,7 @@ import io
 import json
 import os
 import secrets
+import shutil
 import sqlite3
 import stat
 import sys
@@ -660,22 +661,57 @@ def _write_temporary_at(directory_fd: int, output_name: str, payload: bytes) -> 
     return temporary_name
 
 
+def _publish_snapshot(snapshot: Path, result: dict, json_payload: bytes) -> None:
+    payloads = {
+        "casebook.json": json_payload,
+        "casebook.md": render_casebook_markdown(result),
+        "casebook.csv": render_casebook_csv(result),
+    }
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    if snapshot.exists():
+        if not snapshot.is_dir() or any(
+            not (snapshot / name).is_file() or (snapshot / name).read_bytes() != payload
+            for name, payload in payloads.items()
+        ):
+            raise EvidenceError(f"immutable casebook snapshot conflict at {snapshot}")
+        return
+    temporary = snapshot.parent / f".{snapshot.name}.{secrets.token_hex(16)}.tmp"
+    temporary.mkdir(mode=0o700)
+    try:
+        for name, payload in payloads.items():
+            path = temporary / name
+            with path.open("wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        temporary_fd = _open_directory(temporary)
+        try:
+            os.fsync(temporary_fd)
+        finally:
+            os.close(temporary_fd)
+        os.rename(temporary, snapshot)
+        parent_fd = _open_directory(snapshot.parent)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary)
+
+
 def publish_casebook(
     runs_root: Path,
     output: Path,
     milestone_target: int = 20,
-    markdown_output: Path | None = None,
-    csv_output: Path | None = None,
+    snapshot_output: Path | None = None,
 ) -> dict:
     output.parent.mkdir(parents=True, exist_ok=True)
-    requested_outputs = [path for path in (markdown_output, csv_output) if path is not None]
-    if any(path.parent != output.parent for path in requested_outputs):
-        raise ValueError("all casebook outputs must share one directory")
     parent_fd = _open_directory(output.parent)
     lock_name = f".{output.name}.lock"
     lock_fd = None
     locked = False
-    temporary_names: dict[str, str] = {}
+    temporary_name = None
     try:
         lock_fd = os.open(
             lock_name,
@@ -690,58 +726,45 @@ def publish_casebook(
             raise EvidenceError(f"casebook publication already running for {output}") from error
 
         result = build_casebook(runs_root, milestone_target=milestone_target)
-        payloads = {}
-        if markdown_output is not None:
-            payloads[markdown_output.name] = render_casebook_markdown(result)
-        if csv_output is not None:
-            payloads[csv_output.name] = render_casebook_csv(result)
-        payloads[output.name] = render_casebook(result)
-        if len(payloads) != 1 + len(requested_outputs):
-            raise ValueError("casebook output names must be unique")
-        old_payloads = {
-            name: _optional_regular_at(parent_fd, name, output.parent / name) for name in payloads
-        }
-        for name, payload in payloads.items():
-            temporary_names[name] = _write_temporary_at(parent_fd, name, payload)
+        payload = render_casebook(result)
+        old_payload = _optional_regular_at(parent_fd, output.name, output)
+        temporary_name = _write_temporary_at(parent_fd, output.name, payload)
         try:
-            for name in payloads:
-                os.replace(
-                    temporary_names[name],
-                    name,
-                    src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
-                )
-                temporary_names.pop(name)
+            os.replace(
+                temporary_name,
+                output.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            temporary_name = None
             os.fsync(parent_fd)
         except BaseException as primary_error:
             try:
-                for name, old_payload in old_payloads.items():
-                    if old_payload is None:
+                if old_payload is None:
+                    with suppress(FileNotFoundError):
+                        os.unlink(output.name, dir_fd=parent_fd)
+                else:
+                    recovery_name = _write_temporary_at(parent_fd, output.name, old_payload)
+                    try:
+                        os.replace(
+                            recovery_name,
+                            output.name,
+                            src_dir_fd=parent_fd,
+                            dst_dir_fd=parent_fd,
+                        )
+                    finally:
                         with suppress(FileNotFoundError):
-                            os.unlink(name, dir_fd=parent_fd)
-                    else:
-                        recovery_name = _write_temporary_at(parent_fd, name, old_payload)
-                        try:
-                            os.replace(
-                                recovery_name,
-                                name,
-                                src_dir_fd=parent_fd,
-                                dst_dir_fd=parent_fd,
-                            )
-                        finally:
-                            with suppress(FileNotFoundError):
-                                os.unlink(recovery_name, dir_fd=parent_fd)
+                            os.unlink(recovery_name, dir_fd=parent_fd)
                 os.fsync(parent_fd)
             except BaseException as recovery_error:
                 primary_error.add_note(f"casebook publication recovery failed: {recovery_error!r}")
             raise primary_error
 
-        reopened_payloads = {
-            name: _read_regular_at(parent_fd, name, output.parent / name) for name in payloads
-        }
-        if reopened_payloads != payloads:
+        reopened = _read_regular_at(parent_fd, output.name, output)
+        if reopened != payload:
             raise EvidenceError("published casebook bytes changed")
-        reopened = reopened_payloads[output.name]
+        if snapshot_output is not None:
+            _publish_snapshot(snapshot_output, result, payload)
         summary = result["summary"]
         return {
             "output": str(output),
@@ -754,7 +777,7 @@ def publish_casebook(
     finally:
         primary_error = sys.exception()
         cleanup_errors: list[BaseException] = []
-        for temporary_name in temporary_names.values():
+        if temporary_name is not None:
             try:
                 os.unlink(temporary_name, dir_fd=parent_fd)
             except FileNotFoundError:

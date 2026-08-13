@@ -512,7 +512,7 @@ def test_casebook_cli_publishes_machine_result(tmp_path: Path, capsys):
     assert result["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
 
 
-def test_casebook_cli_publishes_json_markdown_and_csv_from_one_snapshot(tmp_path: Path):
+def test_casebook_cli_publishes_json_and_immutable_human_snapshot(tmp_path: Path):
     runs = tmp_path / "runs"
     _write_run(
         runs,
@@ -522,8 +522,7 @@ def test_casebook_cli_publishes_json_markdown_and_csv_from_one_snapshot(tmp_path
         strategy_version="v2-1d-4h-1h",
     )
     output = tmp_path / "casebook.json"
-    markdown = tmp_path / "casebook.md"
-    csv_output = tmp_path / "casebook.csv"
+    snapshot = tmp_path / "snapshots" / "1786521599999"
 
     assert (
         main(
@@ -533,18 +532,19 @@ def test_casebook_cli_publishes_json_markdown_and_csv_from_one_snapshot(tmp_path
                 str(runs),
                 "--output",
                 str(output),
-                "--markdown-output",
-                str(markdown),
-                "--csv-output",
-                str(csv_output),
+                "--snapshot-output",
+                str(snapshot),
             ]
         )
         == 0
     )
 
     assert json.loads(output.read_text())["cases"][0]["pipeline_steps"][0]["gate"] == V2_GATES[0]
-    assert "## Hourly pipeline matrix" in markdown.read_text()
-    assert len(list(csv.DictReader(csv_output.read_text().splitlines()))) == len(V2_GATES) * 2
+    assert "## Hourly pipeline matrix" in (snapshot / "casebook.md").read_text()
+    csv_rows = list(csv.DictReader((snapshot / "casebook.csv").read_text().splitlines()))
+    assert len(csv_rows) == len(V2_GATES) * 2
+    assert json.loads((snapshot / "casebook.json").read_text()) == json.loads(output.read_text())
+    assert not list(snapshot.parent.glob(".*.tmp"))
 
 
 @pytest.mark.parametrize(
@@ -717,7 +717,28 @@ def test_directory_fsync_failure_restores_existing_output(tmp_path: Path, monkey
     assert not (tmp_path / ".casebook.json.rollback").exists()
 
 
-def test_multi_format_publication_restores_one_coherent_snapshot_on_failure(
+def test_immutable_snapshot_conflict_fails_closed(tmp_path: Path):
+    runs = tmp_path / "runs"
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    output = tmp_path / "casebook.json"
+    snapshot = tmp_path / "snapshots" / "1786521599999"
+    snapshot.mkdir(parents=True)
+    (snapshot / "casebook.json").write_bytes(b"conflicting-generation")
+
+    with pytest.raises(EvidenceError, match="immutable casebook snapshot conflict"):
+        publish_casebook(runs, output, 20, snapshot)
+
+    assert (snapshot / "casebook.json").read_bytes() == b"conflicting-generation"
+    assert not list(snapshot.parent.glob(".*.tmp"))
+
+
+def test_snapshot_directory_appears_only_after_all_formats_are_complete(
     tmp_path: Path, monkeypatch
 ):
     runs = tmp_path / "runs"
@@ -729,28 +750,38 @@ def test_multi_format_publication_restores_one_coherent_snapshot_on_failure(
         strategy_version="v2-1d-4h-1h",
     )
     output = tmp_path / "casebook.json"
-    markdown = tmp_path / "casebook.md"
-    csv_output = tmp_path / "casebook.csv"
-    old = {
-        output: b"old-json",
-        markdown: b"old-markdown",
-        csv_output: b"old-csv",
+    snapshot = tmp_path / "snapshots" / "1786521599999"
+    entered = threading.Event()
+    release = threading.Event()
+    real_rename = __import__("smc_ict.casebook", fromlist=["os"]).os.rename
+
+    def blocked_snapshot_rename(source, destination):
+        entered.set()
+        release.wait(timeout=5)
+        return real_rename(source, destination)
+
+    monkeypatch.setattr("smc_ict.casebook.os.rename", blocked_snapshot_rename)
+    errors = []
+
+    def publish():
+        try:
+            publish_casebook(runs, output, 20, snapshot)
+        except Exception as error:
+            errors.append(error)
+
+    publisher = threading.Thread(target=publish)
+    publisher.start()
+    assert entered.wait(timeout=5)
+    assert not snapshot.exists()
+    release.set()
+    publisher.join(timeout=5)
+
+    assert not errors
+    assert {path.name for path in snapshot.iterdir()} == {
+        "casebook.json",
+        "casebook.md",
+        "casebook.csv",
     }
-    for path, payload in old.items():
-        path.write_bytes(payload)
-    real_replace = __import__("smc_ict.casebook", fromlist=["os"]).os.replace
-
-    def fail_csv_publish(source, destination, **kwargs):
-        if destination == csv_output.name and str(source).endswith(".tmp"):
-            raise OSError("injected csv publication failure")
-        return real_replace(source, destination, **kwargs)
-
-    monkeypatch.setattr("smc_ict.casebook.os.replace", fail_csv_publish)
-    with pytest.raises(OSError, match="csv publication"):
-        publish_casebook(runs, output, 20, markdown, csv_output)
-
-    assert {path: path.read_bytes() for path in old} == old
-    assert not list(tmp_path.glob(".casebook.*.tmp"))
 
 
 def test_directory_fsync_failure_removes_new_output(tmp_path: Path, monkeypatch):

@@ -238,6 +238,29 @@ def test_casebook_human_exports_show_every_pipeline_step(tmp_path: Path):
     assert csv_rows[0]["value_json"] == "{}"
 
 
+def test_casebook_human_exports_only_render_active_v2_cohort(tmp_path: Path):
+    runs = tmp_path / "runs"
+    _write_run(runs, "run-v1", 1_786_517_339_999)
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+
+    result = build_casebook(runs)
+    markdown = render_casebook_markdown(result).decode()
+    csv_rows = list(csv.DictReader(io.StringIO(render_casebook_csv(result).decode())))
+
+    assert "run-v1" not in markdown
+    assert "1D Regime" in markdown
+    assert all(row["analysis_run_id"] == "run-v2" for row in csv_rows)
+    assert len(csv_rows) == len(V2_GATES) * 2
+    matrix_lines = [line for line in markdown.splitlines() if line.startswith("|")]
+    assert len({line.count("|") for line in matrix_lines}) == 1
+
+
 def test_casebook_keeps_v1_and_v2_denominators_separate(tmp_path: Path):
     runs = tmp_path / "runs"
     _write_run(runs, "run-v1", 1_786_517_339_999)
@@ -692,6 +715,42 @@ def test_directory_fsync_failure_restores_existing_output(tmp_path: Path, monkey
     assert output.read_bytes() == b"known-good-output"
     assert not list(tmp_path.glob(".casebook.json.*.tmp"))
     assert not (tmp_path / ".casebook.json.rollback").exists()
+
+
+def test_multi_format_publication_restores_one_coherent_snapshot_on_failure(
+    tmp_path: Path, monkeypatch
+):
+    runs = tmp_path / "runs"
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    output = tmp_path / "casebook.json"
+    markdown = tmp_path / "casebook.md"
+    csv_output = tmp_path / "casebook.csv"
+    old = {
+        output: b"old-json",
+        markdown: b"old-markdown",
+        csv_output: b"old-csv",
+    }
+    for path, payload in old.items():
+        path.write_bytes(payload)
+    real_replace = __import__("smc_ict.casebook", fromlist=["os"]).os.replace
+
+    def fail_csv_publish(source, destination, **kwargs):
+        if destination == csv_output.name and str(source).endswith(".tmp"):
+            raise OSError("injected csv publication failure")
+        return real_replace(source, destination, **kwargs)
+
+    monkeypatch.setattr("smc_ict.casebook.os.replace", fail_csv_publish)
+    with pytest.raises(OSError, match="csv publication"):
+        publish_casebook(runs, output, 20, markdown, csv_output)
+
+    assert {path: path.read_bytes() for path in old} == old
+    assert not list(tmp_path.glob(".casebook.*.tmp"))
 
 
 def test_directory_fsync_failure_removes_new_output(tmp_path: Path, monkeypatch):

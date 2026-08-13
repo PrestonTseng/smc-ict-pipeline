@@ -536,8 +536,13 @@ def _compact_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False)
 
 
+def _active_cases(result: dict) -> list[dict]:
+    active_strategy = result["summary"]["active_strategy_version"]
+    return [case for case in result["cases"] if case["strategy_version"] == active_strategy]
+
+
 def render_casebook_markdown(result: dict) -> bytes:
-    cases = result["cases"]
+    cases = _active_cases(result)
     gates = [step["gate"] for step in cases[0]["pipeline_steps"]] if cases else []
     lines = [
         "# SMC/ICT Pipeline Casebook",
@@ -612,7 +617,7 @@ def render_casebook_csv(result: dict) -> bytes:
     )
     writer = csv.DictWriter(output, fieldnames=fields)
     writer.writeheader()
-    for case in result["cases"]:
+    for case in _active_cases(result):
         for step in case["pipeline_steps"]:
             writer.writerow(
                 {
@@ -663,11 +668,14 @@ def publish_casebook(
     csv_output: Path | None = None,
 ) -> dict:
     output.parent.mkdir(parents=True, exist_ok=True)
+    requested_outputs = [path for path in (markdown_output, csv_output) if path is not None]
+    if any(path.parent != output.parent for path in requested_outputs):
+        raise ValueError("all casebook outputs must share one directory")
     parent_fd = _open_directory(output.parent)
     lock_name = f".{output.name}.lock"
     lock_fd = None
     locked = False
-    temporary_name = None
+    temporary_names: dict[str, str] = {}
     try:
         lock_fd = os.open(
             lock_name,
@@ -681,49 +689,59 @@ def publish_casebook(
         except BlockingIOError as error:
             raise EvidenceError(f"casebook publication already running for {output}") from error
 
-        old_payload = _optional_regular_at(parent_fd, output.name, output)
         result = build_casebook(runs_root, milestone_target=milestone_target)
-        payload = render_casebook(result)
-        temporary_name = _write_temporary_at(parent_fd, output.name, payload)
+        payloads = {}
+        if markdown_output is not None:
+            payloads[markdown_output.name] = render_casebook_markdown(result)
+        if csv_output is not None:
+            payloads[csv_output.name] = render_casebook_csv(result)
+        payloads[output.name] = render_casebook(result)
+        if len(payloads) != 1 + len(requested_outputs):
+            raise ValueError("casebook output names must be unique")
+        old_payloads = {
+            name: _optional_regular_at(parent_fd, name, output.parent / name) for name in payloads
+        }
+        for name, payload in payloads.items():
+            temporary_names[name] = _write_temporary_at(parent_fd, name, payload)
         try:
-            os.replace(
-                temporary_name,
-                output.name,
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
-            )
-            temporary_name = None
+            for name in payloads:
+                os.replace(
+                    temporary_names[name],
+                    name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+                temporary_names.pop(name)
             os.fsync(parent_fd)
         except BaseException as primary_error:
             try:
-                if old_payload is None:
-                    os.unlink(output.name, dir_fd=parent_fd)
-                else:
-                    recovery_name = _write_temporary_at(parent_fd, output.name, old_payload)
-                    try:
-                        os.replace(
-                            recovery_name,
-                            output.name,
-                            src_dir_fd=parent_fd,
-                            dst_dir_fd=parent_fd,
-                        )
-                    finally:
+                for name, old_payload in old_payloads.items():
+                    if old_payload is None:
                         with suppress(FileNotFoundError):
-                            os.unlink(recovery_name, dir_fd=parent_fd)
+                            os.unlink(name, dir_fd=parent_fd)
+                    else:
+                        recovery_name = _write_temporary_at(parent_fd, name, old_payload)
+                        try:
+                            os.replace(
+                                recovery_name,
+                                name,
+                                src_dir_fd=parent_fd,
+                                dst_dir_fd=parent_fd,
+                            )
+                        finally:
+                            with suppress(FileNotFoundError):
+                                os.unlink(recovery_name, dir_fd=parent_fd)
                 os.fsync(parent_fd)
             except BaseException as recovery_error:
                 primary_error.add_note(f"casebook publication recovery failed: {recovery_error!r}")
             raise primary_error
 
-        reopened = _read_regular_at(parent_fd, output.name, output)
-        if reopened != payload:
+        reopened_payloads = {
+            name: _read_regular_at(parent_fd, name, output.parent / name) for name in payloads
+        }
+        if reopened_payloads != payloads:
             raise EvidenceError("published casebook bytes changed")
-        if markdown_output is not None:
-            markdown_output.parent.mkdir(parents=True, exist_ok=True)
-            markdown_output.write_bytes(render_casebook_markdown(result))
-        if csv_output is not None:
-            csv_output.parent.mkdir(parents=True, exist_ok=True)
-            csv_output.write_bytes(render_casebook_csv(result))
+        reopened = reopened_payloads[output.name]
         summary = result["summary"]
         return {
             "output": str(output),
@@ -736,7 +754,7 @@ def publish_casebook(
     finally:
         primary_error = sys.exception()
         cleanup_errors: list[BaseException] = []
-        if temporary_name is not None:
+        for temporary_name in temporary_names.values():
             try:
                 os.unlink(temporary_name, dir_fd=parent_fd)
             except FileNotFoundError:

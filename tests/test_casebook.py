@@ -1,4 +1,6 @@
+import csv
 import hashlib
+import io
 import json
 import os
 import sqlite3
@@ -7,7 +9,14 @@ from pathlib import Path
 
 import pytest
 
-from smc_ict.casebook import EvidenceError, build_casebook, publish_casebook, render_casebook
+from smc_ict.casebook import (
+    EvidenceError,
+    build_casebook,
+    publish_casebook,
+    render_casebook,
+    render_casebook_csv,
+    render_casebook_markdown,
+)
 from smc_ict.cli import main
 from smc_ict.config import config_hash as compute_config_hash
 from smc_ict.pipeline.state_machine import GATES
@@ -185,8 +194,48 @@ def test_valid_runs_produce_deterministic_cases_and_summary(tmp_path: Path):
     ).encode()
     expected_id = hashlib.sha256(expected_identity).hexdigest()
     assert first["case_id"] == expected_id
+    assert [step["gate"] for step in first["pipeline_steps"]] == list(GATES)
+    assert first["pipeline_steps"][0] == {
+        "gate": GATES[0],
+        "status": "FAIL",
+        "reason_codes": ["no_confirmed_bos"],
+        "value": {},
+        "reference_levels": {},
+        "event_time": None,
+        "known_at": None,
+        "input_hash": "b" * 64,
+        "config_hash": "a" * 64,
+    }
+    assert first["pipeline_steps"][1]["status"] == "UNAVAILABLE"
+    assert first["pipeline_steps"][1]["reason_codes"] == ["upstream_gate_not_passed"]
     assert render_casebook(result).endswith(b"\n")
     assert render_casebook(result) == render_casebook(build_casebook(runs, milestone_target=20))
+
+
+def test_casebook_human_exports_show_every_pipeline_step(tmp_path: Path):
+    runs = tmp_path / "runs"
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+
+    result = build_casebook(runs)
+    markdown = render_casebook_markdown(result).decode()
+    csv_rows = list(csv.DictReader(io.StringIO(render_casebook_csv(result).decode())))
+
+    assert "| Boundary (UTC) | Symbol | Decision | 1D Regime | 4H Structure |" in markdown
+    assert "## Pipeline step details" in markdown
+    assert "`smc_1d_regime` — **FAIL** — no_confirmed_bos" in markdown
+    assert "`smc_4h_structure` — **UNAVAILABLE** — upstream_gate_not_passed" in markdown
+    assert len(csv_rows) == len(V2_GATES) * 2
+    assert [row["gate"] for row in csv_rows[: len(V2_GATES)]] == list(V2_GATES)
+    assert csv_rows[0]["symbol"] == "BTCUSDT"
+    assert csv_rows[0]["status"] == "FAIL"
+    assert csv_rows[0]["reason_codes"] == "no_confirmed_bos"
+    assert csv_rows[0]["value_json"] == "{}"
 
 
 def test_casebook_keeps_v1_and_v2_denominators_separate(tmp_path: Path):
@@ -438,6 +487,41 @@ def test_casebook_cli_publishes_machine_result(tmp_path: Path, capsys):
     assert result["output"] == str(output)
     assert result["eligible_cases"] == 0
     assert result["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
+
+
+def test_casebook_cli_publishes_json_markdown_and_csv_from_one_snapshot(tmp_path: Path):
+    runs = tmp_path / "runs"
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    output = tmp_path / "casebook.json"
+    markdown = tmp_path / "casebook.md"
+    csv_output = tmp_path / "casebook.csv"
+
+    assert (
+        main(
+            [
+                "casebook",
+                "--runs-root",
+                str(runs),
+                "--output",
+                str(output),
+                "--markdown-output",
+                str(markdown),
+                "--csv-output",
+                str(csv_output),
+            ]
+        )
+        == 0
+    )
+
+    assert json.loads(output.read_text())["cases"][0]["pipeline_steps"][0]["gate"] == V2_GATES[0]
+    assert "## Hourly pipeline matrix" in markdown.read_text()
+    assert len(list(csv.DictReader(csv_output.read_text().splitlines()))) == len(V2_GATES) * 2
 
 
 @pytest.mark.parametrize(

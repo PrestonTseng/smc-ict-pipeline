@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import csv
 import fcntl
 import hashlib
+import io
 import json
 import os
 import secrets
@@ -378,6 +380,7 @@ def _eligible_cases(run: Path, manifest: dict, manifest_hash: str, payloads, has
                 "failed_gate": failed_gate,
                 "passed_gates": passed,
                 "reason_codes": reasons,
+                "pipeline_steps": [{"gate": gate, **indicators[gate]} for gate in gates],
                 "dataset_version": manifest["dataset_version"],
                 "dataset_checksum": manifest["dataset_checksum"],
                 "ingestion_run_id": manifest["ingestion_run_id"],
@@ -510,6 +513,130 @@ def render_casebook(result: dict) -> bytes:
     return _canonical(result) + b"\n"
 
 
+_GATE_LABELS = {
+    "smc_1d_regime": "1D Regime",
+    "smc_4h_structure": "4H Structure",
+    "smc_4h_dealing_range": "4H Range",
+    "smc_4h_order_block": "4H Order Block",
+    "ict_1h_liquidity": "1H Liquidity",
+    "ict_1h_displacement": "1H Displacement",
+    "ict_1h_mss": "1H MSS",
+    "ict_1h_fvg": "1H FVG",
+    "risk": "Risk",
+}
+
+
+def _utc(timestamp: int | None) -> str:
+    if timestamp is None:
+        return ""
+    return datetime.fromtimestamp(timestamp / 1000, UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _compact_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False)
+
+
+def render_casebook_markdown(result: dict) -> bytes:
+    cases = result["cases"]
+    gates = [step["gate"] for step in cases[0]["pipeline_steps"]] if cases else []
+    lines = [
+        "# SMC/ICT Pipeline Casebook",
+        "",
+        f"- Active strategy: `{result['summary']['active_strategy_version']}`",
+        f"- Eligible cases: {result['summary']['eligible_cases']}",
+        f"- Unique hourly boundaries: {result['summary']['unique_analysis_boundaries']}",
+        "",
+        "## Hourly pipeline matrix",
+        "",
+        "| Boundary (UTC) | Symbol | Decision | "
+        + " | ".join(_GATE_LABELS.get(gate, gate) for gate in gates)
+        + " |",
+        "|---|---|---|" + "---|" * len(gates),
+    ]
+    for case in cases:
+        cells = [
+            f"{step['status']} ({'; '.join(step['reason_codes']) or '-'})"
+            for step in case["pipeline_steps"]
+        ]
+        lines.append(
+            f"| {_utc(case['analysis_boundary'])} | {case['symbol']} | {case['status']} | "
+            + " | ".join(cells)
+            + " |"
+        )
+    lines.extend(["", "## Pipeline step details", ""])
+    for case in cases:
+        lines.extend(
+            [
+                f"### {_utc(case['analysis_boundary'])} · {case['symbol']}",
+                "",
+                f"Decision: **{case['status']}**; failed gate: `{case['failed_gate'] or '-'}`.",
+                "",
+            ]
+        )
+        for step in case["pipeline_steps"]:
+            reasons = "; ".join(step["reason_codes"]) or "-"
+            value_json = _compact_json(step["value"])
+            levels_json = _compact_json(step["reference_levels"])
+            lines.extend(
+                [
+                    f"- `{step['gate']}` — **{step['status']}** — {reasons}",
+                    (
+                        f"  - event: `{_utc(step['event_time']) or '-'}`; "
+                        f"known: `{_utc(step['known_at']) or '-'}`"
+                    ),
+                    f"  - value: `{value_json}`",
+                    f"  - reference levels: `{levels_json}`",
+                ]
+            )
+        lines.append("")
+    return ("\n".join(lines) + "\n").encode()
+
+
+def render_casebook_csv(result: dict) -> bytes:
+    output = io.StringIO(newline="")
+    fields = (
+        "analysis_boundary_utc",
+        "symbol",
+        "decision_status",
+        "failed_gate",
+        "gate",
+        "status",
+        "reason_codes",
+        "event_time_utc",
+        "known_at_utc",
+        "value_json",
+        "reference_levels_json",
+        "analysis_run_id",
+        "dataset_version",
+        "case_id",
+    )
+    writer = csv.DictWriter(output, fieldnames=fields)
+    writer.writeheader()
+    for case in result["cases"]:
+        for step in case["pipeline_steps"]:
+            writer.writerow(
+                {
+                    "analysis_boundary_utc": _utc(case["analysis_boundary"]),
+                    "symbol": case["symbol"],
+                    "decision_status": case["status"],
+                    "failed_gate": case["failed_gate"] or "",
+                    "gate": step["gate"],
+                    "status": step["status"],
+                    "reason_codes": ";".join(step["reason_codes"]),
+                    "event_time_utc": _utc(step["event_time"]),
+                    "known_at_utc": _utc(step["known_at"]),
+                    "value_json": json.dumps(step["value"], sort_keys=True, separators=(",", ":")),
+                    "reference_levels_json": json.dumps(
+                        step["reference_levels"], sort_keys=True, separators=(",", ":")
+                    ),
+                    "analysis_run_id": case["analysis_run_id"],
+                    "dataset_version": case["dataset_version"],
+                    "case_id": case["case_id"],
+                }
+            )
+    return output.getvalue().encode()
+
+
 def _write_temporary_at(directory_fd: int, output_name: str, payload: bytes) -> str:
     temporary_name = f".{output_name}.{secrets.token_hex(16)}.tmp"
     descriptor = os.open(
@@ -528,7 +655,13 @@ def _write_temporary_at(directory_fd: int, output_name: str, payload: bytes) -> 
     return temporary_name
 
 
-def publish_casebook(runs_root: Path, output: Path, milestone_target: int = 20) -> dict:
+def publish_casebook(
+    runs_root: Path,
+    output: Path,
+    milestone_target: int = 20,
+    markdown_output: Path | None = None,
+    csv_output: Path | None = None,
+) -> dict:
     output.parent.mkdir(parents=True, exist_ok=True)
     parent_fd = _open_directory(output.parent)
     lock_name = f".{output.name}.lock"
@@ -585,6 +718,12 @@ def publish_casebook(runs_root: Path, output: Path, milestone_target: int = 20) 
         reopened = _read_regular_at(parent_fd, output.name, output)
         if reopened != payload:
             raise EvidenceError("published casebook bytes changed")
+        if markdown_output is not None:
+            markdown_output.parent.mkdir(parents=True, exist_ok=True)
+            markdown_output.write_bytes(render_casebook_markdown(result))
+        if csv_output is not None:
+            csv_output.parent.mkdir(parents=True, exist_ok=True)
+            csv_output.write_bytes(render_casebook_csv(result))
         summary = result["summary"]
         return {
             "output": str(output),

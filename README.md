@@ -120,8 +120,18 @@ Build a deterministic research casebook from verified immutable runs:
 uv run smc-ict casebook \
   --runs-root var/runs \
   --output var/evidence/casebook.json \
+  --markdown-output var/evidence/casebook.md \
+  --csv-output var/evidence/casebook.csv \
   --milestone-target 20
 ```
+
+Each case includes `pipeline_steps` in authoritative gate order. Every step keeps
+its status, reason codes, value, reference levels, event time, known-at time,
+input hash, and config hash from the immutable `decision.json`; the casebook does
+not recompute historical indicators. The Markdown export provides an hourly
+boundary × symbol matrix plus detailed step evidence. The CSV export uses one
+row per step for filtering and pivoting. The scheduled analysis wrapper rebuilds
+all three views each hour.
 
 The reader verifies the exact run artifact set, manifest identities, config and
 decision SHA-256 values, per-indicator provenance, and aggregate decision

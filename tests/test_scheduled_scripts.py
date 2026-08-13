@@ -15,11 +15,15 @@ def _fake_uv(tmp_path: Path, outputs: list[str]) -> tuple[Path, Path]:
     uv.write_text(
         "#!/usr/bin/env python3\n"
         "import os\n"
+        "import sys\n"
         "from pathlib import Path\n"
         "counter=Path(os.environ['FAKE_UV_COUNTER'])\n"
         "responses=Path(os.environ['FAKE_UV_RESPONSES']).read_text().splitlines()\n"
         "attempt=int(counter.read_text()) if counter.exists() else 0\n"
         "counter.write_text(str(attempt+1))\n"
+        "invocations=os.environ.get('FAKE_UV_INVOCATIONS')\n"
+        "if invocations:\n"
+        "    with Path(invocations).open('a') as f: f.write(' '.join(sys.argv[1:])+'\\n')\n"
         "print(responses[min(attempt, len(responses)-1)])\n"
     )
     uv.chmod(0o755)
@@ -32,6 +36,7 @@ def _run_analysis_script(tmp_path: Path, outputs: list[str]):
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "FAKE_UV_COUNTER": str(counter),
         "FAKE_UV_RESPONSES": str(tmp_path / "responses"),
+        "FAKE_UV_INVOCATIONS": str(tmp_path / "invocations"),
         "SMC_ICT_RETRY_DELAY": "0",
         "SMC_ICT_MAX_LOCK_ATTEMPTS": "3",
         "SMC_ICT_LOG_DIR": str(tmp_path / "logs"),
@@ -60,6 +65,11 @@ def test_scheduled_analysis_retries_lock_collision_then_builds_casebook(tmp_path
     )
     assert result.returncode == 0
     assert counter.read_text() == "4"
+    invocation = (tmp_path / "invocations").read_text().splitlines()[-1]
+    assert "--markdown-output" in invocation
+    assert str(tmp_path / "evidence" / "casebook.md") in invocation
+    assert "--csv-output" in invocation
+    assert str(tmp_path / "evidence" / "casebook.csv") in invocation
 
 
 def test_scheduled_analysis_reports_persistent_lock_collision(tmp_path: Path):
@@ -104,6 +114,7 @@ def test_scheduled_ingest_retries_lock_collision(tmp_path: Path):
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "FAKE_UV_COUNTER": str(counter),
         "FAKE_UV_RESPONSES": str(tmp_path / "responses"),
+        "FAKE_UV_INVOCATIONS": str(tmp_path / "invocations"),
         "SMC_ICT_RETRY_DELAY": "0",
         "SMC_ICT_MAX_LOCK_ATTEMPTS": "3",
         "SMC_ICT_LOG_DIR": str(tmp_path / "logs"),
@@ -126,6 +137,7 @@ def test_scheduled_ingest_reports_persistent_lock_collision(tmp_path: Path):
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "FAKE_UV_COUNTER": str(counter),
         "FAKE_UV_RESPONSES": str(tmp_path / "responses"),
+        "FAKE_UV_INVOCATIONS": str(tmp_path / "invocations"),
         "SMC_ICT_RETRY_DELAY": "0",
         "SMC_ICT_MAX_LOCK_ATTEMPTS": "3",
         "SMC_ICT_LOG_DIR": str(tmp_path / "logs"),

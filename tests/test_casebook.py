@@ -728,7 +728,7 @@ def test_immutable_snapshot_conflict_fails_closed(tmp_path: Path):
     )
     output = tmp_path / "casebook.json"
     snapshot = tmp_path / "snapshots" / "1786521599999"
-    snapshot.mkdir(parents=True)
+    publish_casebook(runs, output, 20, snapshot)
     (snapshot / "casebook.json").write_bytes(b"conflicting-generation")
 
     with pytest.raises(EvidenceError, match="immutable casebook snapshot conflict"):
@@ -736,6 +736,65 @@ def test_immutable_snapshot_conflict_fails_closed(tmp_path: Path):
 
     assert (snapshot / "casebook.json").read_bytes() == b"conflicting-generation"
     assert not list(snapshot.parent.glob(".*.tmp"))
+
+
+def test_existing_snapshot_rejects_symlink_directory(tmp_path: Path):
+    runs = tmp_path / "runs"
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    output = tmp_path / "casebook.json"
+    target = tmp_path / "mutable-snapshot"
+    publish_casebook(runs, output, 20, target)
+    snapshot = tmp_path / "snapshots" / "1786521599999"
+    snapshot.parent.mkdir()
+    snapshot.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(EvidenceError, match="snapshot must be a real directory"):
+        publish_casebook(runs, output, 20, snapshot)
+
+
+def test_existing_snapshot_rejects_symlink_file(tmp_path: Path):
+    runs = tmp_path / "runs"
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    output = tmp_path / "casebook.json"
+    snapshot = tmp_path / "snapshots" / "1786521599999"
+    publish_casebook(runs, output, 20, snapshot)
+    mutable = tmp_path / "mutable.json"
+    mutable.write_bytes((snapshot / "casebook.json").read_bytes())
+    (snapshot / "casebook.json").unlink()
+    (snapshot / "casebook.json").symlink_to(mutable)
+
+    with pytest.raises(EvidenceError, match="snapshot entry must be a regular file"):
+        publish_casebook(runs, output, 20, snapshot)
+
+
+def test_existing_snapshot_rejects_extra_entry(tmp_path: Path):
+    runs = tmp_path / "runs"
+    _write_run(
+        runs,
+        "run-v2",
+        1_786_520_939_999,
+        schema_version="2",
+        strategy_version="v2-1d-4h-1h",
+    )
+    output = tmp_path / "casebook.json"
+    snapshot = tmp_path / "snapshots" / "1786521599999"
+    publish_casebook(runs, output, 20, snapshot)
+    (snapshot / "extra.txt").write_text("not part of the snapshot")
+
+    with pytest.raises(EvidenceError, match="snapshot entry set mismatch"):
+        publish_casebook(runs, output, 20, snapshot)
 
 
 def test_snapshot_directory_appears_only_after_all_formats_are_complete(

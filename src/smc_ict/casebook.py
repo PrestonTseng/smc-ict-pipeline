@@ -668,12 +668,23 @@ def _publish_snapshot(snapshot: Path, result: dict, json_payload: bytes) -> None
         "casebook.csv": render_casebook_csv(result),
     }
     snapshot.parent.mkdir(parents=True, exist_ok=True)
-    if snapshot.exists():
-        if not snapshot.is_dir() or any(
-            not (snapshot / name).is_file() or (snapshot / name).read_bytes() != payload
-            for name, payload in payloads.items()
-        ):
-            raise EvidenceError(f"immutable casebook snapshot conflict at {snapshot}")
+    if snapshot.exists() or snapshot.is_symlink():
+        try:
+            snapshot_fd = _open_directory(snapshot)
+        except EvidenceError as error:
+            raise EvidenceError("snapshot must be a real directory") from error
+        try:
+            if set(_directory_entries(snapshot_fd)) != set(payloads):
+                raise EvidenceError("snapshot entry set mismatch")
+            for name, payload in payloads.items():
+                try:
+                    actual = _read_regular_at(snapshot_fd, name, snapshot / name)
+                except EvidenceError as error:
+                    raise EvidenceError("snapshot entry must be a regular file") from error
+                if actual != payload:
+                    raise EvidenceError(f"immutable casebook snapshot conflict at {snapshot}")
+        finally:
+            os.close(snapshot_fd)
         return
     temporary = snapshot.parent / f".{snapshot.name}.{secrets.token_hex(16)}.tmp"
     temporary.mkdir(mode=0o700)
